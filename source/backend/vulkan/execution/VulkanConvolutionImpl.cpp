@@ -14,7 +14,7 @@
 //#define MNN_OPEN_TIME_TRACE
 #include <MNN/AutoTime.hpp>
 namespace MNN {
-
+//#define VULKAN_IM2COL_GEMM_UNIT 512
 std::shared_ptr<VulkanBuffer> VulkanConvolutionImpl::createBufferForSlideWindow(const VulkanBackend* extra,
                                                                                 const Convolution2DCommon* convOption,
                                                                                 const float* weightPtr, int ci,
@@ -116,15 +116,8 @@ public:
         /*Write Command Buffer*/
         if (true) {
             mConvSet.reset(mConvPipeline->createSet());
-
-            auto vkBackend = (VulkanBackend*)backend();
-            auto vkOutput  = vkBackend->findTensor(output->deviceId());
-            auto vkInput   = vkBackend->findTensor(input->deviceId());
-            cmdBuffer->barrierImageIfNeeded(vkOutput->image(), VK_IMAGE_LAYOUT_GENERAL);
-            cmdBuffer->barrierImageIfNeeded(vkInput->image(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-
-            mConvSet->writeImage((VkImageView)output->deviceId(), mSampler->get(), VK_IMAGE_LAYOUT_GENERAL, 0);
-            mConvSet->writeImage((VkImageView)input->deviceId(), mSampler->get(),
+            mConvSet->writeImage(((VulkanTensor*)output->deviceId())->image()->view(), mSampler->get(), VK_IMAGE_LAYOUT_GENERAL, 0);
+            mConvSet->writeImage(((VulkanTensor*)input->deviceId())->image()->view(), mSampler->get(),
                                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 1);
             mConvSet->writeImage(mKernel->view(), mSampler->get(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 2);
             mConvSet->writeImage(mBias->view(), mSampler->get(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 3);
@@ -226,114 +219,98 @@ public:
         auto dst         = outputs[0];
         const int icDiv4 = UP_DIV(src->channel(), 4);
         const int ocDiv4 = UP_DIV(dst->channel(), 4);
-        auto vkBn  = (VulkanBackend*)backend();
-        auto vkSrc = vkBn->findTensor(src->deviceId());
-        auto vkDst = vkBn->findTensor(dst->deviceId());
-        if (inputs.size() > 1) {
-            int ci = inputs[1]->length(1);
-            int co = inputs[1]->length(0);
-            int kh = inputs[1]->length(2);
-            int kw = inputs[1]->length(3);
-            auto l = ALIGN_UP4(ci) * kh * kw;
-            auto h = co;
-            mWeightReorder.reset(new VulkanMatMul::Reorder(vkBn, true));
-            mKernel  = std::make_shared<VulkanImage>(vkBn->getDynamicMemoryPool(), false,
-                                                    std::vector<int>{l, UP_DIV(h, 4) * 1});
-            mTempWeightBuffer.reset(new VulkanBuffer(vkBn->getDynamicMemoryPool(), false, mWeightReorder->computeMiddleBufferSize(co, kh, kw, ci)*sizeof(float), nullptr, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT));
-            VulkanMatMul::Reorder::nchwBuffer parameters;
-            writeParameters(parameters, co, ci, kh, kw);
-            mWeightReorder->encode((VkBuffer)inputs[1]->deviceId(), inputs[1]->size(), mTempWeightBuffer->buffer()
-                           , mTempWeightBuffer->size(), mKernel.get(), cmdBuffer, parameters);
-            mTempWeightBuffer->release();
-            if (inputs.size() > 2) {
-                mBias         = std::make_shared<VulkanImage>(vkBn->getDynamicMemoryPool(), false, UP_DIV(co, 4), 1);
-                mBiasCopy.reset(new VulkanConvolutionCommon::BufferToImageCopy(vkBn));
-                mBiasCopy->encode(mBias.get(), (VkBuffer)(inputs[2]->deviceId()), inputs[2]->size(), cmdBuffer);
-                cmdBuffer->barrierImageIfNeeded(mBias.get(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-                // cmdBuffer->barrierImage(mBias->get(), VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-            }
-        }
-        int permitMaxBatch = (vkBn->proty().limits.maxImageDimension1D * 4) / (dst->width() * dst->height());
-        if (permitMaxBatch < 1) {
-            MNN_ERROR("Don't support too large feature: %d x %d\n", dst->width(), dst->height());
+        auto vkBn = (VulkanBackend*)backend();
+        int limit = vkBn->proty().limits.maxImageDimension2D * 4;
+#ifdef VULKAN_IM2COL_GEMM_UNIT
+        limit = VULKAN_IM2COL_GEMM_UNIT;
+#endif
+        if (limit < dst->width()) {
+            MNN_ERROR("Don't support width too large feature: %d x %d, limit = %d\n", dst->width(), dst->height(), limit);
             return NOT_SUPPORT;
         }
-        auto unitBatch = permitMaxBatch;
-        if (unitBatch > dst->batch()) {
-            unitBatch = dst->batch();
+        int batchLoopNumber = 1;
+        int heightLoopNumber = 1;
+        int unitHeight = dst->height();
+        int unitBatch = dst->batch();
+        auto area = dst->width() * dst->height();
+        if (limit < area) {
+            batchLoopNumber = dst->batch();
+            unitBatch = 1;
+            unitHeight = limit / dst->width();
+            heightLoopNumber = UP_DIV(dst->height(), unitHeight);
+        } else if (limit < area * dst->batch()) {
+            unitBatch = limit / area;
+            batchLoopNumber = UP_DIV(dst->batch(), unitBatch);
         }
-        int loopNumber = (dst->batch() + unitBatch - 1) / unitBatch;
+        int loopNumber = batchLoopNumber * heightLoopNumber;
         mConvParams.resize(loopNumber);
         mMultilers.resize(loopNumber);
         mIm2ColSet.resize(loopNumber);
         mCol2ImSet.resize(loopNumber);
 
-        for (int i=0; i<loopNumber; ++i) {
+        for (int i=0; i<batchLoopNumber; ++i) {
             int batchOffset = i * unitBatch;
             int currentBatch = dst->batch() - batchOffset;
             if (currentBatch > unitBatch) {
                 currentBatch = unitBatch;
             }
-            auto totalNumberInput = currentBatch * icDiv4 * dst->width() * dst->height();
-            auto totalNumberOutput = currentBatch * ocDiv4 * dst->width() * dst->height();
-            mConvParams[i] = std::make_shared<VulkanBuffer>(vkBn->getMemoryPool(), false,
-                                                    sizeof(VulkanConvolutionCommon::ConvolutionParameter), nullptr,
-                                                    VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
-            {
-                auto convCons = reinterpret_cast<VulkanConvolutionCommon::ConvolutionParameter*>(mConvParams[i]->map());
-                VulkanConvolutionCommon::writeParameter(convCons, mConvCommonOption, src, dst);
-                convCons->batch = batchOffset;
-                convCons->outputSize[3] = currentBatch;
-                mConvParams[i]->unmap();
-            }
-            mIm2ColSet[i].reset(mIm2Col->createSet());
-            mCol2ImSet[i].reset(mCol2Im->createSet());
-            mMultilers[i] = mMultiCreator();
-            mMultilers[i]->prepare(cmdBuffer, dst->width() * dst->height() * currentBatch);
-            auto mMultiler = mMultilers[i].get();
-            if (true) {
-                auto colImage = mMultiler->source();
-                cmdBuffer->barrierImageIfNeeded(colImage, VK_IMAGE_LAYOUT_GENERAL);
-                cmdBuffer->barrierImageIfNeeded(vkSrc->image(), VK_IMAGE_LAYOUT_GENERAL);
-                mIm2ColSet[i]->writeImage(colImage->view(), mSampler->get(), VK_IMAGE_LAYOUT_GENERAL, 0);
-                mIm2ColSet[i]->writeImage((reinterpret_cast<VkImageView>(src->deviceId())), mSampler->get(),
-                                    VK_IMAGE_LAYOUT_GENERAL, 1);
-                mIm2ColSet[i]->writeBuffer(mConvParams[i]->buffer(), 2, mConvParams[i]->size());
-                mIm2Col->bind(cmdBuffer->get(), mIm2ColSet[i]->get());
-                vkCmdDispatch(cmdBuffer->get(), UP_DIV(totalNumberInput, VulkanConvolutionCommon::gImage2ColLocal),
-                            1, 1);
-            }
-            mMultilers[i]->compute(cmdBuffer);
-            if (true) {
-                auto dstImage = mMultiler->dest();
-                mCol2ImSet[i]->writeImage(dstImage->view(), mSampler->get(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0);
-                mCol2ImSet[i]->writeImage((reinterpret_cast<VkImageView>(dst->deviceId())), mSampler->get(),
-                                    VK_IMAGE_LAYOUT_GENERAL, 1);
+            for (int j=0; j<heightLoopNumber; ++j) {
+                int heightOffset = j * unitHeight;
+                int currentHeight = dst->height() - heightOffset;
+                if (currentHeight > unitHeight) {
+                    currentHeight = unitHeight;
+                }
+                auto index = i * heightLoopNumber + j;
+                auto totalNumberInput = currentBatch * icDiv4 * dst->width() * currentHeight;
+                auto totalNumberOutput = currentBatch * ocDiv4 * dst->width() * currentHeight;
+                mConvParams[index] = std::make_shared<VulkanBuffer>(vkBn->getMemoryPool(), false,
+                                                        sizeof(VulkanConvolutionCommon::ConvolutionParameter), nullptr,
+                                                        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+                {
+                    auto convCons = reinterpret_cast<VulkanConvolutionCommon::ConvolutionParameter*>(mConvParams[index]->map());
+                    VulkanConvolutionCommon::writeParameter(convCons, mConvCommonOption, src, dst);
+                    convCons->batch = batchOffset;
+                    convCons->hOffset = heightOffset;
+                    convCons->outputSize[3] = currentBatch;
+                    convCons->outputSize[1] = currentHeight;
+                    mConvParams[index]->unmap();
+                }
+                mIm2ColSet[index].reset(mIm2Col->createSet());
+                mCol2ImSet[index].reset(mCol2Im->createSet());
+                mMultilers[index] = mMultiCreator();
+                mMultilers[index]->prepare(cmdBuffer, dst->width() * currentHeight * currentBatch);
+                auto mMultiler = mMultilers[index].get();
+                if (true) {
+                    auto colImage = mMultiler->source();
+                    cmdBuffer->barrierImageIfNeeded(colImage, VK_IMAGE_LAYOUT_GENERAL);
+                    mIm2ColSet[index]->writeImage(colImage->view(), mSampler->get(), VK_IMAGE_LAYOUT_GENERAL, 0);
+                    mIm2ColSet[index]->writeImage((reinterpret_cast<VulkanTensor*>(src->deviceId()))->image()->view(), mSampler->get(),
+                                        VK_IMAGE_LAYOUT_GENERAL, 1);
+                    mIm2ColSet[index]->writeBuffer(mConvParams[index]->buffer(), 2, mConvParams[index]->size());
+                    mIm2Col->bind(cmdBuffer->get(), mIm2ColSet[index]->get());
+                    vkCmdDispatch(cmdBuffer->get(), UP_DIV(totalNumberInput, VulkanConvolutionCommon::gImage2ColLocal),
+                                1, 1);
+                }
+                mMultilers[index]->compute(cmdBuffer);
+                if (true) {
+                    auto dstImage = mMultiler->dest();
+                    mCol2ImSet[index]->writeImage(dstImage->view(), mSampler->get(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0);
+                    mCol2ImSet[index]->writeImage((reinterpret_cast<VulkanTensor*>(dst->deviceId()))->image()->view(), mSampler->get(),
+                                        VK_IMAGE_LAYOUT_GENERAL, 1);
 
-                mCol2ImSet[i]->writeImage(mBias->view(), mSampler->get(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 2);
-                mCol2ImSet[i]->writeBuffer(mConvParams[i]->buffer(), 3, mConvParams[i]->size());
-                mCol2Im->bind(cmdBuffer->get(), mCol2ImSet[i]->get());
-                cmdBuffer->barrierImageIfNeeded(dstImage, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-                cmdBuffer->barrierImageIfNeeded(vkDst->image(), VK_IMAGE_LAYOUT_GENERAL);
-                // cmdBuffer->barrierImage(dstImage->get(), VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-                vkCmdDispatch(cmdBuffer->get(), UP_DIV(totalNumberOutput, VulkanConvolutionCommon::gImage2ColLocal),
-                            1, 1);
+                    mCol2ImSet[index]->writeImage(mBias->view(), mSampler->get(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 2);
+                    mCol2ImSet[index]->writeBuffer(mConvParams[index]->buffer(), 3, mConvParams[index]->size());
+                    mCol2Im->bind(cmdBuffer->get(), mCol2ImSet[index]->get());
+                    cmdBuffer->barrierImageIfNeeded(dstImage, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                    // cmdBuffer->barrierImage(dstImage->get(), VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                    vkCmdDispatch(cmdBuffer->get(), UP_DIV(totalNumberOutput, VulkanConvolutionCommon::gImage2ColLocal),
+                                1, 1);
+                }
             }
         }
-        if (inputs.size() > 1) {
-            mKernel->release();
-        }
-        if (inputs.size() > 2) {
-            mBias->release();
-        }
-
         return NO_ERROR;
     }
 private:
-    std::shared_ptr<VulkanMatMul::Reorder> mWeightReorder;
-    std::shared_ptr<VulkanConvolutionCommon::BufferToImageCopy> mBiasCopy;
-    std::shared_ptr<VulkanBuffer> mTempWeightBuffer;
-
     const VulkanPipeline* mIm2Col;
     const VulkanPipeline* mCol2Im;
     const VulkanSampler* mSampler;
@@ -360,7 +337,7 @@ VulkanBasicExecution* VulkanConvolutionImpl::create(VulkanBackend* backend, cons
         return new VulkanConvolutionSlideWindow(backend, convOption, weightPtr, biasPtr, ci, co);
     }
     if (VulkanConvolutionWinograd::support(convOption)) {
-        if (output->width() >= 4 && output->height() >= 4) {
+        if (output->width() >= 4 && output->height() >= 4 && output->batch() == 1) {
             return new VulkanConvolutionWinograd(backend, convOption, weightPtr, biasPtr, ci, co);
         }
     }
