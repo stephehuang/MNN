@@ -22,6 +22,11 @@ public:
 
 private:
     std::shared_ptr<Tensor> mScales;
+    float mZeroPoint;
+    int8_t mClampMin;
+    int8_t mClampMax;
+    int mClipBits;
+    bool mSingle = false;
 };
 
 } // namespace MNN

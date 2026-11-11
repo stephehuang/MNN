@@ -15,6 +15,7 @@
 #include <thread>
 #include <vector>
 #include <atomic>
+#include <cstdint>
 #include <MNN/MNNDefine.h>
 namespace MNN {
 
@@ -22,37 +23,46 @@ class MNN_PUBLIC ThreadPool {
 public:
     typedef std::pair<std::function<void(int)>, int> TASK;
 
-    int number() const {
+    int numberThread() const {
         return mNumberThread;
     }
-    static void enqueue(TASK&& task, int index);
+    void enqueue(TASK* task, int index);
 
-    static void active();
-    static void deactive();
+    void active();
+    void deactive();
 
-    static int acquireWorkIndex();
-    static void releaseWorkIndex(int index);
+    int acquireWorkIndex();
+    void releaseWorkIndex(int index);
 
-    static int init(int number);
+    static int init(int numberThread, unsigned long cpuMask, ThreadPool*& threadPool);
     static void destroy();
 
 private:
-    void enqueueInternal(TASK&& task, int index);
+    void enqueueInternal(TASK* task, int index);
 
-    static ThreadPool* gInstance;
-    ThreadPool(int number = 0);
+    ThreadPool(int numberThread = 0);
     ~ThreadPool();
 
     std::vector<std::thread> mWorkers;
     std::vector<bool> mTaskAvailable;
     std::atomic<bool> mStop = {false};
 
-    std::vector<std::pair<TASK, std::vector<std::atomic_bool*>>> mTasks;
+    std::vector<std::pair<TASK*, std::vector<std::atomic_bool*>>> mTasks;
+    // Aligned blocks owning the completion flags in mTasks; flags sit at
+    // 128-byte strides inside (see kFlagStride in ThreadPool.cpp).
+    std::vector<void*> mFlagBlocks;
     std::condition_variable mCondition;
     std::mutex mQueueMutex;
 
     int mNumberThread            = 0;
     std::atomic_int mActiveCount = {0};
+    // Bit i set: worker i is blocked on mCondition while the pool is active.
+    // enqueueInternal consults this to wake sleepers only when a flagged
+    // worker is among them, keeping the hot path notify-free. Fixed-width so
+    // the shift stays defined where `unsigned long` is 32-bit; a worker whose
+    // index exceeds the bit width gets no bit and never blocks, see
+    // kSleepMaskWidth in ThreadPool.cpp.
+    std::atomic<uint64_t> mSleepMask = {0};
 };
 } // namespace MNN
 #endif

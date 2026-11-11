@@ -6,8 +6,8 @@
 //  Copyright © 2018, Alibaba Group Holding Limited
 //
 
+#include "shape/SizeComputer.hpp"
 #include "core/Macro.h"
-#include "core/SizeComputer.hpp"
 #include "core/TensorUtils.hpp"
 
 namespace MNN {
@@ -26,4 +26,5 @@ class SizeOpComputer : public SizeComputer {
 };
 
 REGISTER_SHAPE(SizeOpComputer, OpType_Size);
+REGISTER_SHAPE(SizeOpComputer, OpType_Rank);
 } // namespace MNN

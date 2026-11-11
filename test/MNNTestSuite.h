@@ -14,6 +14,23 @@
 #include <string.h>
 #include <string>
 #include <vector>
+#include <cstdint>
+
+#include <MNN/MNNDefine.h>
+#include <MNN/MNNForwardType.h>
+
+
+#if defined(_MSC_VER)
+#include <Windows.h>
+#undef min
+#undef max
+#undef NO_ERROR
+#else
+#include <sys/time.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <dirent.h>
+#endif
 
 /** test case */
 class MNNTestCase {
@@ -25,9 +42,11 @@ public:
      */
     virtual ~MNNTestCase() = default;
     /**
-     * @brief run test case
+     * @brief run test case with runtime precision, see FP32Converter in TestUtil.h.
+     * @param precision  fp32 / bf16 precision should use FP32Converter[1 - 2].
+     * fp16 precision should use FP32Converter[3].
      */
-    virtual bool run() = 0;
+    virtual bool run(int precision) = 0;
 
 private:
     /** case name */
@@ -46,6 +65,21 @@ public:
      * @return shared instance
      */
     static MNNTestSuite* get();
+    struct Status {
+        int precision = 0;
+        int memory = 0;
+        int power = 0;
+        int forwardType = 0;
+        int dynamicOption = 0;
+        int thread = 0;
+    };
+    Status pStaus;
+    /**
+     * Cases that the running backend cannot exercise, reported through
+     * MNNTEST_CPU_ONLY. Counted apart from passed so that a green run is not
+     * mistaken for full coverage.
+     */
+    int skipped = 0;
 
 public:
     /**
@@ -55,14 +89,17 @@ public:
      */
     void add(MNNTestCase* test, const char* name);
     /**
-     * @brief run all registered test case
+     * @brief run all registered test case with runtime precision, see FP32Converter in TestUtil.h.
+     * @param precision . fp32 / bf16 precision should use FP32Converter[1 - 2].
+     * fp16 precision should use FP32Converter[3].
      */
-    static void runAll();
+    static int runAll(int precision, const char* flag = "");
     /**
-     * @brief run registered test case that matches in name
-     * @param name case name
+     * @brief run test case with runtime precision, see FP32Converter in TestUtil.h.
+     * @param precision . fp32 / bf16 precision should use FP32Converter[1 - 2].
+     * fp16 precision should use FP32Converter[3].
      */
-    static void run(const char* name);
+    static int run(const char* name, int precision, const char* flag = "");
 
 private:
     /** get shared instance */
@@ -99,6 +136,19 @@ public:
             MNN_ERROR("Error for %s, %d\n", __func__, __LINE__); \
             return false;                                        \
         }                                                        \
+    }
+
+/**
+ * Gate a case to the CPU backend; on every other backend it reports itself
+ * skipped instead of running. Use it where a case asserts numbers only the CPU
+ * implementation produces, so the missing backend support stays visible in the
+ * result counts instead of as a red run that has to be re-diagnosed each time.
+ */
+#define MNNTEST_CPU_ONLY()                                                                        \
+    if (MNNTestSuite::get()->pStaus.forwardType != MNN_FORWARD_CPU) {                             \
+        MNNTestSuite::get()->skipped++;                                                           \
+        MNN_PRINT("\tskip: CPU-only case, backend=%d\n", MNNTestSuite::get()->pStaus.forwardType); \
+        return true;                                                                              \
     }
 
 #endif

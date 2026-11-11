@@ -9,132 +9,174 @@
 #include "backend/cpu/CPUROIPooling.hpp"
 #include <float.h>
 #include <math.h>
+#include "CPUTensorConvert.hpp"
 #include "backend/cpu/CPUBackend.hpp"
-#include "backend/cpu/compute/CommonOptFunction.h"
-#include "core/Macro.h"
 #include "core/TensorUtils.hpp"
-
-#ifdef MNN_USE_NEON
-#include <arm_neon.h>
-#endif
 
 namespace MNN {
 
-CPUROIPooling::CPUROIPooling(Backend *backend, int pooledWidth, int pooledHeight, float spatialScale)
-    : Execution(backend), mPooledWidth(pooledWidth), mPooledHeight(pooledHeight), mSpatialScale(spatialScale) {
+CPUROIPooling::CPUROIPooling(Backend *backend, int pooledWidth, int pooledHeight, float spatialScale, bool outputGrad)
+    : CPUROIAlign(backend, pooledWidth, pooledHeight, 0, spatialScale, false, PoolType_MAX, outputGrad) {
     // nothing to do
 }
 
-ErrorCode CPUROIPooling::onResize(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) {
-    // roi transform space
-    auto &roi = inputs[1]->buffer();
-    memcpy(mROI.buffer().dim, roi.dim, sizeof(halide_dimension_t) * roi.dimensions);
-    TensorUtils::getDescribe(&mROI)->dimensionFormat = MNN_DATA_FORMAT_NCHW;
-    TensorUtils::setLinearLayout(&mROI);
-    backend()->onAcquireBuffer(&mROI, Backend::DYNAMIC);
-
-    // release temp buffer space
-    backend()->onReleaseBuffer(&mROI, Backend::DYNAMIC);
-
-    return NO_ERROR;
-}
-
-static inline int max(int a, int b) {
-    return a > b ? a : b;
-}
-static inline int min(int a, int b) {
-    return a < b ? a : b;
-}
+static inline int max(int a, int b) { return a > b ? a : b; }
+static inline int min(int a, int b) { return a < b ? a : b; }
 
 ErrorCode CPUROIPooling::onExecute(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) {
     auto &input  = inputs[0];
     auto &output = outputs[0];
+    auto core = static_cast<CPUBackend*>(backend())->functions();
 
-    // download
-    for (int i = 0; i < mROI.batch(); ++i) {
-        auto &roi = inputs[1];
-        MNNUnpackC4(mROI.host<float>() + i * mROI.buffer().dim[0].stride,
-                    roi->host<float>() + i * roi->buffer().dim[0].stride, roi->width() * roi->height(), roi->channel());
+    CPUTensorConverter::convert(inputs[1], &mROI, core);
+
+    // dataType of ROI must be float32.
+    Tensor *roiTensor = &mROI;
+    auto roiPtrSrc = roiTensor->host<float>();
+    if (core->bytes != 4) {
+        core->MNNLowpToFp32(mROI.host<int16_t>(), mROITemp->host<float>(), mROI.elementSize());
+        roiPtrSrc = mROITemp->host<float>();
     }
 
-    // get params
-    auto iw = input->width(), ih = input->height(), is = iw * ih * 4;
-    auto ow = output->width(), oh = output->height(), os = ow * oh * 4;
-    auto slice     = UP_DIV(input->channel(), 4);
-    auto numROI    = inputs[1]->batch();
-    auto batchSize = input->batch();
+    if (mOutputGrad == false) {
+        // get params
+        auto iw = input->width(), ih = input->height(), is = iw * ih * core->pack;
+        auto ow = output->width(), oh = output->height(), os = ow * oh * core->pack;
+        auto slice  = UP_DIV(input->channel(), core->pack);
+        auto numROI = inputs[1]->batch();
+        for (int n = 0; n < numROI; ++n) {
+            auto batchOutput = output->host<uint8_t>() + os * n * core->bytes;
+            auto roiPtr      = roiPtrSrc + roiTensor->buffer().dim[0].stride * n;
+            int roi          = roiPtr[0];
+            int x1           = round(roiPtr[1] * mSpatialScale);
+            int y1           = round(roiPtr[2] * mSpatialScale);
+            int x2           = round(roiPtr[3] * mSpatialScale);
+            int y2           = round(roiPtr[4] * mSpatialScale);
+            MNN_ASSERT(roi < input->batch());
 
-    for (int n = 0; n < numROI; ++n) {
-        auto batchOutput = output->host<float>() + output->buffer().dim[0].stride * n;
-        auto roiPtr      = mROI.host<float>() + mROI.buffer().dim[0].stride * n;
-        int roi          = roiPtr[0];
-        int x1           = round(roiPtr[1] * mSpatialScale);
-        int y1           = round(roiPtr[2] * mSpatialScale);
-        int x2           = round(roiPtr[3] * mSpatialScale);
-        int y2           = round(roiPtr[4] * mSpatialScale);
-        MNN_ASSERT(roi < batchSize);
+            int roiW = max(x2 - x1 + 1, 1);
+            int roiH = max(y2 - y1 + 1, 1);
 
-        int roiW = max(x2 - x1 + 1, 1);
-        int roiH = max(y2 - y1 + 1, 1);
+            float binSizeW = (float)roiW / (float)mPooledWidth;
+            float binSizeH = (float)roiH / (float)mPooledHeight;
 
-        float binSizeW = (float)roiW / (float)mPooledWidth;
-        float binSizeH = (float)roiH / (float)mPooledHeight;
-
-        auto batchInput = input->host<float>() + input->buffer().dim[0].stride * roi;
-        for (int s = 0; s < slice; s++) {
-            auto sliceInput = batchInput + is * s;
-            auto rowOutput  = batchOutput + os * s;
-            float binPh     = 0;
-            for (int ph = 0; ph < mPooledHeight; ph++, rowOutput += mPooledWidth * 4) {
-                // Compute pooling region for this output unit:
-                //  start (included) = floor(ph * roiHeight / pooledHeight)
-                //  end (excluded) = ceil((ph + 1) * roiHeight / pooledHeight)
-                int hStart = min(max(y1 + (int)floorf(binPh), 0), ih);
-                binPh += binSizeH;
-                int hEnd = min(max(y1 + (int)ceilf(binPh), 0), ih);
-                int hLen = hEnd - hStart;
-                if (hLen <= 0) {
-                    memset(rowOutput, 0, mPooledWidth * 4 * sizeof(float));
-                    continue;
-                }
-
-                float binPw = 0;
-                for (int pw = 0; pw < mPooledWidth; pw++) {
-                    int wStart = min(max(x1 + (int)floorf(binPw), 0), iw);
-                    binPw += binSizeW;
-                    int wEnd = min(max(x1 + (int)ceilf(binPw), 0), iw);
-                    int wLen = wEnd - wStart;
-                    if (wLen <= 0) {
-                        memset(rowOutput + pw * 4, 0, 4 * sizeof(float));
+            auto batchInput = input->host<uint8_t>() + is * roi * core->bytes;
+            for (int s = 0; s < slice; s++) {
+                auto sliceInput = batchInput + is * input->batch() * s * core->bytes;
+                auto rowOutput  = batchOutput + os * output->batch() * s * core->bytes;
+                float binPh     = 0;
+                for (int ph = 0; ph < mPooledHeight; ph++, rowOutput += mPooledWidth * core->pack * core->bytes) {
+                    // Compute pooling region for this output unit:
+                    //  start (included) = floor(ph * roiHeight / pooledHeight)
+                    //  end (excluded) = ceil((ph + 1) * roiHeight / pooledHeight)
+                    int hStart = min(max(y1 + (int)floorf(binPh), 0), ih);
+                    binPh += binSizeH;
+                    int hEnd = min(max(y1 + (int)ceilf(binPh), 0), ih);
+                    int hLen = hEnd - hStart;
+                    if (hLen <= 0) {
+                        memset(rowOutput, 0, mPooledWidth * core->pack * core->bytes * sizeof(uint8_t));
                         continue;
                     }
 
-#ifdef MNN_USE_NEON
-                    auto ptr        = sliceInput + (hStart * iw + wStart) * 4;
-                    float32x4_t max = vdupq_n_f32(-FLT_MAX);
-                    // float32x4_t max = vdupq_n_f32(-MAXFLOAT);
-                    for (int h = 0; h < hLen; h++, ptr += iw * 4) {
-                        for (int w = 0; w < wLen; w++) {
-                            float32x4_t in = vld1q_f32(ptr + w * 4);
-                            max            = vmaxq_f32(max, in);
+                    float binPw = 0;
+                    for (int pw = 0; pw < mPooledWidth; pw++) {
+                        int wStart = min(max(x1 + (int)floorf(binPw), 0), iw);
+                        binPw += binSizeW;
+                        int wEnd = min(max(x1 + (int)ceilf(binPw), 0), iw);
+                        int wLen = wEnd - wStart;
+                        if (wLen <= 0) {
+                            memset(rowOutput + pw * core->pack * core->bytes, 0, core->pack * core->bytes * sizeof(uint8_t));
+                            continue;
                         }
+                        core->MNNRoiPoolingMax((float *)(rowOutput + pw * core->pack * core->bytes), (float *)(sliceInput + (hStart * iw + wStart) * core->pack * core->bytes), hLen, wLen, iw);
                     }
-                    vst1q_f32(rowOutput + pw * 4, max);
-#else
-                    for (int i = 0; i < 4; i++) {
-                        auto ptr  = sliceInput + (hStart * iw + wStart) * 4 + i;
-                        float max = -FLT_MAX;
-                        for (int h = 0; h < hLen; h++, ptr += iw * 4) {
-                            for (int w = 0; w < wLen; w++) {
-                                max = std::max(max, ptr[w * 4]);
-                            }
-                        }
-                        rowOutput[pw * 4 + i] = max;
-                    }
-#endif
                 }
             }
         }
+    } else {
+#ifndef MNN_REDUCE_SIZE
+        // get params
+        auto iw = input->width(), ih = input->height(), is = iw * ih * core->pack;
+        // backward mode, output shape is the same with input[0] shape
+        auto& bwDiff = inputs[2];
+        auto ow = bwDiff->width(), oh = bwDiff->height(), os = ow * oh * core->pack;
+        auto slice  = UP_DIV(input->channel(), core->pack);
+        auto numROI = inputs[1]->batch();
+        ::memset(output->host<uint8_t>(), 0, static_cast<CPUBackend*>(backend())->getTensorSize(output, true));
+        for (int n = 0; n < numROI; ++n) {
+            auto batchBwDiff = inputs[2]->host<uint8_t>() + os * n * core->bytes;
+            auto roiPtr      = roiPtrSrc + roiTensor->buffer().dim[0].stride * n;
+            int roi          = roiPtr[0];
+            int x1           = round(roiPtr[1] * mSpatialScale);
+            int y1           = round(roiPtr[2] * mSpatialScale);
+            int x2           = round(roiPtr[3] * mSpatialScale);
+            int y2           = round(roiPtr[4] * mSpatialScale);
+            MNN_ASSERT(roi < input->batch());
+
+            int roiW = max(x2 - x1 + 1, 1);
+            int roiH = max(y2 - y1 + 1, 1);
+
+            float binSizeW = (float)roiW / (float)mPooledWidth;
+            float binSizeH = (float)roiH / (float)mPooledHeight;
+
+            auto batchInput = input->host<uint8_t>() + is * roi * core->bytes;
+            auto batchOutput = output->host<uint8_t>() + is * roi * core->bytes;
+            for (int s = 0; s < slice; s++) {
+                auto sliceInput = batchInput + is * input->batch() * s * core->bytes;
+                auto sliceOutput = batchOutput + is * input->batch() * s * core->bytes;
+                auto rowBwDiff  = batchBwDiff + os * bwDiff->batch() * s * core->bytes;
+                float binPh     = 0;
+                for (int ph = 0; ph < mPooledHeight; ph++, rowBwDiff += mPooledWidth * core->pack * core->bytes) {
+                    // Compute pooling region for this output unit:
+                    //  start (included) = floor(ph * roiHeight / pooledHeight)
+                    //  end (excluded) = ceil((ph + 1) * roiHeight / pooledHeight)
+                    int hStart = min(max(y1 + (int)floorf(binPh), 0), ih);
+                    binPh += binSizeH;
+                    int hEnd = min(max(y1 + (int)ceilf(binPh), 0), ih);
+                    int hLen = hEnd - hStart;
+                    if (hLen <= 0) {
+                        continue;
+                    }
+
+                    float binPw = 0;
+                    for (int pw = 0; pw < mPooledWidth; pw++) {
+                        int wStart = min(max(x1 + (int)floorf(binPw), 0), iw);
+                        binPw += binSizeW;
+                        int wEnd = min(max(x1 + (int)ceilf(binPw), 0), iw);
+                        int wLen = wEnd - wStart;
+                        if (wLen <= 0) {
+                            continue;
+                        }
+                        {
+                            std::vector<int> indices(core->pack);
+                            std::vector<float> maxes(core->pack, -FLT_MAX);
+                            float* src = (float *)(sliceInput + (hStart * iw + wStart) * core->pack * core->bytes);
+                            float* diff = (float *)(rowBwDiff + pw * core->pack * core->bytes);
+                            for (int h = 0; h < hLen; h++, src += iw * core->pack) {
+                                for (int w = 0; w < wLen; w++) {
+                                    int spatialIndex = (h + hStart) * iw + (wStart + w);
+                                    float* srcPtr = src + w * core->pack;
+                                    std::vector<float*> pre(core->pack, nullptr);
+                                    for (int k = 0; k < core->pack; k++) {
+                                        if (srcPtr[k] > maxes[k]) {
+                                            maxes[k] = srcPtr[k];
+                                            indices[k] = spatialIndex;
+                                        }
+                                    }
+                                }
+                            }
+                            for (int k = 0; k < core->pack; k++) {
+                                int h = indices[k] / iw;
+                                int w = indices[k] % iw;
+                                float* out = (float *)(sliceOutput + (h * iw + w) * core->pack * core->bytes);
+                                out[k] += diff[k];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+#endif
     }
 
     return NO_ERROR;
@@ -144,8 +186,16 @@ class CPUROIPoolingCreator : public CPUBackend::Creator {
 public:
     virtual Execution *onCreate(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs,
                                 const MNN::Op *op, Backend *backend) const {
-        auto roi = op->main_as_RoiPooling();
-        return new CPUROIPooling(backend, roi->pooledWidth(), roi->pooledHeight(), roi->spatialScale());
+        auto roi = op->main_as_RoiParameters();
+        auto core = static_cast<CPUBackend*>(backend)->functions();
+        if (core->MNNRoiPoolingMax == nullptr) {
+            MNN_ERROR("Don't have function for CPUROIPooling\n");
+            return nullptr;
+        }
+        if (core->bytes < 4 && roi->outputGrad()) {
+            return nullptr;
+        }
+        return new CPUROIPooling(backend, roi->pooledWidth(), roi->pooledHeight(), roi->spatialScale(), roi->outputGrad());
     }
 };
 REGISTER_CPU_OP_CREATOR(CPUROIPoolingCreator, OpType_ROIPooling);

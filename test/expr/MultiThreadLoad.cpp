@@ -1,25 +1,31 @@
 //
-//  MultiThreadLoadTest.cpp
+//  MultiThreadLoad.cpp
 //  MNNTests
 //
 //  Created by MNN on 2019/09/26.
 //  Copyright © 2018, Alibaba Group Holding Limited
 //
 
-#include <MNN/expr/ExprCreator.hpp>
-#include "MNNTestSuite.h"
 #include <MNN/Interpreter.hpp>
-#include "MNN_generated.h"
+#include <MNN/expr/ExprCreator.hpp>
 #include <thread>
+#include "MNNTestSuite.h"
+#include "TestUtils.h"
+#include "MNN_generated.h"
 using namespace MNN::Express;
 using namespace MNN;
 
 class MultiThreadLoadTest : public MNNTestCase {
 public:
-    virtual bool run() {
+    virtual bool run(int precision) {
         auto x1 = _Input({4}, NHWC, halide_type_of<float>());
         auto x0 = _Input({4}, NCHW, halide_type_of<float>());
-        auto y = _Add(x1, x0);
+        auto y  = _Add(x1, x0);
+        y       = _Abs(y);
+        y       = _Sign(y);
+        y       = _Square(y);
+        y       = _Cos(y);
+        y       = _Exp(y);
         std::unique_ptr<MNN::NetT> net(new NetT);
         Variable::save({y}, net.get());
         flatbuffers::FlatBufferBuilder builderOutput(1024);
@@ -28,17 +34,21 @@ public:
         int sizeOutput    = builderOutput.GetSize();
         auto bufferOutput = builderOutput.GetBufferPointer();
 
-        std::vector<std::thread> threads;
-        for (int i=0; i<100; ++i) {
-            threads.emplace_back([&](){
-                std::shared_ptr<Interpreter> interp(Interpreter::createFromBuffer(bufferOutput, sizeOutput));
-                ScheduleConfig config;
-                auto session = interp->createSession(config);
-                interp->runSession(session);
-            });
-        }
-        for (auto& t : threads) {
-            t.join();
+        auto forwardType = getCurrentType();
+        for(int n = 0; n < 100; ++n){
+            std::vector<std::thread> threads;
+            for (int i = 0; i < 4; ++i) {
+                threads.emplace_back([&]() {
+                    std::shared_ptr<Interpreter> interp(Interpreter::createFromBuffer(bufferOutput, sizeOutput));
+                    ScheduleConfig config;
+                    config.type = forwardType;
+                    auto session = interp->createSession(config);
+                    interp->runSession(session);
+                });
+            }
+            for (auto& t : threads) {
+                t.join();
+            }
         }
         return true;
     }

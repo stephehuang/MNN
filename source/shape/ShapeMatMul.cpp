@@ -6,45 +6,43 @@
 //  Copyright © 2018, Alibaba Group Holding Limited
 //
 
+#include "shape/SizeComputer.hpp"
 #include "core/Macro.h"
-#include "core/SizeComputer.hpp"
 #include "core/TensorUtils.hpp"
+#include "core/OpCommonUtils.hpp"
 
 namespace MNN {
 
 class MatMulSizeComputer : public SizeComputer {
+    static void _getTranspose(const MNN::Op* op, bool& transposeA, bool& transposeB) {
+        transposeA = false;
+        transposeB = false;
+        if (op->type() == OpType_MatMul) {
+            transposeA = op->main_as_MatMul()->transposeA();
+            transposeB = op->main_as_MatMul()->transposeB();
+        } else {
+            // BatchMatMul
+            transposeA = op->main_as_BatchMatMulParam()->adjX();
+            transposeB = op->main_as_BatchMatMulParam()->adjY();
+        }
+    }
     virtual bool onComputeSize(const MNN::Op* op, const std::vector<Tensor*>& inputs,
                                const std::vector<Tensor*>& outputs) const override {
-        MNN_ASSERT(2 == inputs.size());
         MNN_ASSERT(1 == outputs.size());
-        MNN_ASSERT(op->main_type() == OpParameter_MatMul);
-        auto matMul = op->main_as_MatMul();
-        auto i0Dim = inputs[0]->dimensions();
-        auto i1Dim = inputs[1]->dimensions();
-
         auto output = outputs[0];
-        auto w0 = inputs[0]->length(i0Dim - 1);
-        auto h0 = inputs[0]->length(i0Dim - 2);
         output->buffer().type = inputs[0]->buffer().type;
-
-        if (matMul->transposeA()) {
-            auto t = w0;
-            w0     = h0;
-            h0     = t;
-        }
-
-        auto w1 = inputs[1]->length(i1Dim - 1);
-        auto h1 = inputs[1]->length(i1Dim - 2);
-        if (matMul->transposeB()) {
-            auto t = w1;
-            w1     = h1;
-            h1     = t;
-        }
-
-        if (w0 != h1) {
+        bool transposeA;
+        bool transposeB;
+        _getTranspose(op, transposeA, transposeB);
+        int e, l, h;
+        bool valid = OpCommonUtils::computeMatMulSize(transposeA, transposeB, inputs[0], inputs[1], e, l, h);
+        if (!valid) {
             return false;
         }
         // Compute BroastCast Dims
+        auto i0Dim = inputs[0]->dimensions();
+        auto i1Dim = inputs[1]->dimensions();
+
         auto input0 = inputs[0];
         auto input1 = inputs[1];
         auto o0Dim = i0Dim;
@@ -79,13 +77,65 @@ class MatMulSizeComputer : public SizeComputer {
             }
         }
         // Last Two dim
-        output->setLength(o0Dim - 2, h0);
-        output->setLength(o0Dim - 1, w1);
-        
+        if (o0Dim >= 2) {
+            output->setLength(o0Dim - 2, e);
+            output->setLength(o0Dim - 1, h);
+        } else if (o0Dim == 1) {
+            output->setLength(0, e);
+        }
+        bool eValid = inputs[0]->dimensions() > 1;
+        bool hValid = inputs[1]->dimensions() > 1;
+        int squeezeDim = 0;
+        if (!eValid) {
+            squeezeDim++;
+            if (o0Dim >= 2) {
+                output->setLength(o0Dim - 2, h);
+            }
+        }
+        if (!hValid) {
+            squeezeDim++;
+            if (o0Dim >= 2) {
+                output->setLength(o0Dim - 1, e);
+            }
+        }
+        if (squeezeDim > 0) {
+            int newDim = o0Dim - squeezeDim;
+            if (newDim <= 0) {
+                // Both inputs are 1-D, result is scalar
+                newDim = 1;
+                output->setLength(0, 1);
+            }
+            output->buffer().dimensions = newDim;
+        }
+
         TensorUtils::getDescribe(output)->dimensionFormat = TensorUtils::getDescribe(inputs[0])->dimensionFormat;
         return true;
+    }
+    virtual float onComputeFlops(const MNN::Op* op, const std::vector<Tensor*>& inputs,
+                                 const std::vector<Tensor*>& outputs) const override {
+        bool transposeA;
+        bool transposeB;
+        _getTranspose(op, transposeA, transposeB);
+        int e=0, l=0, h=0;
+        OpCommonUtils::computeMatMulSize(transposeA, transposeB, inputs[0], inputs[1], e, l, h);
+        Tensor* C       = outputs[0];
+        auto flops = (float)e * l * h / FLOPS_M;
+        bool eValid = inputs[0]->dimensions() > 1;
+        bool hValid = inputs[1]->dimensions() > 1;
+        int squeezeDim = 0;
+        if (!eValid) {
+            squeezeDim++;
+        }
+        if (!hValid) {
+            squeezeDim++;
+        }
+        for (int i=0; i<C->dimensions() - 2 + squeezeDim; ++i) {
+            flops *= C->length(i);
+        }
+        return flops;
     }
 };
 
 REGISTER_SHAPE(MatMulSizeComputer, OpType_MatMul);
+REGISTER_SHAPE(MatMulSizeComputer, OpType_BatchMatMul);
 } // namespace MNN

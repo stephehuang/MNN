@@ -9,6 +9,7 @@
 #include <assert.h>
 #include <stdio.h>
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -32,9 +33,20 @@ using namespace std;
 #define L_BLUE "\e[1;34m"
 #define BOLD "\e[1m"
 
+// Formatted extraction can reject finite subnormals, so parse the complete token.
+static bool readFiniteFloat(std::istream& input, float& value) {
+    std::string token;
+    if (!(input >> token)) {
+        return false;
+    }
+    char* end = nullptr;
+    value = std::strtof(token.c_str(), &end);
+    return end == token.c_str() + token.size() && std::isfinite(value);
+}
+
 int main(int argc, char* argv[]) {
     if (argc < 3) {
-        printf("Usage: ./checkDir.out outputDir1 outputDir2 thredhold\n");
+        printf("Usage: ./checkDir.out outputDir1 outputDir2 thredhold [order]\n");
         return 0;
     }
 
@@ -49,36 +61,46 @@ int main(int argc, char* argv[]) {
     printf("tolerance=%f\n", tolerance);
 
     std::vector<std::string> compareFiles;
-#if defined(_MSC_VER)
-    WIN32_FIND_DATA ffd;
-    HANDLE hFind = INVALID_HANDLE_VALUE;
-    hFind = FindFirstFile(argv[1], &ffd);
-    if (INVALID_HANDLE_VALUE == hFind) {
-        printf("Error to open %s\n", argv[1]);
-        return 0;
-    }
-    do {
-        if(INVALID_FILE_ATTRIBUTES != GetFileAttributes(ffd.cFileName) && GetLastError() != ERROR_FILE_NOT_FOUND) {
-            compareFiles.push_back(ffd.cFileName);
+    if (argc > 4) {
+        printf("Order file is %s\n", argv[4]);
+        std::ifstream orderOs(argv[4]);
+        std::string stringLine;
+        while (getline(orderOs, stringLine, '\n')) {
+            compareFiles.emplace_back(stringLine);
         }
-    } while (FindNextFile(hFind, &ffd) != 0);
-    FindClose(hFind);
+    } else {
+#if defined(_MSC_VER)
+        WIN32_FIND_DATA ffd;
+        HANDLE hFind = INVALID_HANDLE_VALUE;
+        hFind = FindFirstFile(argv[1], &ffd);
+        if (INVALID_HANDLE_VALUE == hFind) {
+            printf("Error to open %s\n", argv[1]);
+            return 0;
+        }
+        do {
+            if(INVALID_FILE_ATTRIBUTES != GetFileAttributes(ffd.cFileName) && GetLastError() != ERROR_FILE_NOT_FOUND) {
+                compareFiles.push_back(ffd.cFileName);
+            }
+        } while (FindNextFile(hFind, &ffd) != 0);
+        FindClose(hFind);
 #else
-    // open dir
-    DIR* root = opendir(argv[1]);
-    if (NULL == root) {
-        printf("Error to open %s\n", argv[1]);
-        return 0;
-    }
-    struct dirent* ent;
-    while ((ent = readdir(root)) != NULL) {
-        compareFiles.push_back(ent->d_name);
-    }
-    closedir(root);
+        // open dir
+        DIR* root = opendir(argv[1]);
+        if (NULL == root) {
+            printf("Error to open %s\n", argv[1]);
+            return 0;
+        }
+        struct dirent* ent;
+        while ((ent = readdir(root)) != NULL) {
+            compareFiles.push_back(ent->d_name);
+        }
+        closedir(root);
 #endif
+    }
 
     // compare files
-    for (auto s : compareFiles) {
+    for (int i=0; i<compareFiles.size(); ++i) {
+        auto& s = compareFiles[i];
         if (s.size() <= 2) {
             continue;
         }
@@ -99,19 +121,28 @@ int main(int argc, char* argv[]) {
         int pos      = 0;
         bool correct = true;
         float v1, v2;
-        while (oldOs >> v1) {
-            auto& valid   = newOs >> v2;
+        while (true) {
+            oldOs >> std::ws;
+            newOs >> std::ws;
+            if (oldOs.eof() && newOs.eof() && !oldOs.bad() && !newOs.bad()) {
+                break;
+            }
+            if (!readFiniteFloat(oldOs, v1) || !readFiniteFloat(newOs, v2)) {
+                printf("Error for %d, %s, %d: invalid or missing value\n", i, s.c_str(), pos);
+                correct = false;
+                break;
+            }
             auto absError = fabsf(v1 - v2);
             if (absError <= tolerance && !isnan(absError)) {
                 pos++;
                 continue;
             }
-            printf(RED "Error for %s, %d, v1=%.6f, v2=%.6f\n" NONE, s.c_str(), pos, v1, v2);
+            printf("Error for %d, %s, %d, v1=%.6f, v2=%.6f\n", i, s.c_str(), pos, v1, v2);
             correct = false;
             break;
         }
         if (correct) {
-            printf(GREEN "Correct : %s\n" NONE, s.c_str());
+            printf("Correct %d: %s\n", i, s.c_str());
         }
     }
 

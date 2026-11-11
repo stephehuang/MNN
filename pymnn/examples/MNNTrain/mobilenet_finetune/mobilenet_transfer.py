@@ -14,7 +14,6 @@ def load_feature_extractor(model_file):
     output_var = var_dict['MobilenetV2/Logits/AvgPool']
     # 'False' means the parameters int this module will not update during training
     feature_extractor = nn.load_module([input_var], [output_var], False)
-    feature_extractor = nn.FixModule(feature_extractor)  # fix feature extractor
 
     return feature_extractor
 
@@ -125,8 +124,7 @@ def demo():
 
     net = Net(feature_extractor, num_classes)
 
-    opt = MNN.optim.SGD(1e-3, 0.9, 0.00004)
-    opt.append(net.parameters)
+    opt = MNN.optim.SGD(net, 1e-3, 0.9, 0.00004)
 
     for epoch in range(10):
         train_func(net, train_dataloader, opt, num_classes)

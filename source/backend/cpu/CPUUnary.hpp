@@ -10,18 +10,27 @@
 #define CPUUnary_hpp
 
 #include "core/Execution.hpp"
-#include "MNN_generated.h"
+#include "compute/CommonOptFunction.h"
 
 namespace MNN {
 class CPUUnary : public Execution {
 public:
-    CPUUnary(Backend *b, UnaryOpOperation type);
+    CPUUnary(Backend* b, MNNUnaryExecute proc, MNNUnaryExecuteInt8 procInt8, const int8_t* table);
     virtual ~CPUUnary() = default;
     virtual ErrorCode onResize(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override;
     virtual ErrorCode onExecute(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override;
 
+    static MNNUnaryExecute selectForFloat(int type, int precision);
+    static MNNUnaryExecuteInt8 selectForInt8(int type);
 protected:
-    UnaryOpOperation mType;
+    MNNUnaryExecute mProc;
+    MNNUnaryExecuteInt8 mProcInt8;
+    std::vector<float> mInpScale;
+    std::vector<float> mOupScale;
+    std::vector<ssize_t> mInpZeroPoint;
+    std::vector<ssize_t> mOupZeroPoint;
+    std::vector<ssize_t> mMaxMinValue;
+    std::vector<int8_t> mTableBuffer;
 };
 } // namespace MNN
 #endif /* CPUUnary_hpp */

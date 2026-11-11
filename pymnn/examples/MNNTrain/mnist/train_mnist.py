@@ -6,6 +6,8 @@ from dataset import MnistDataset
 nn = MNN.nn
 F = MNN.expr
 
+# open lazy evaluation for train
+F.lazy_eval(True)
 
 class Net(nn.Module):
     """construct a lenet 5 model"""
@@ -51,7 +53,6 @@ def test_func(net, test_dataloader):
 
     print("test acc: ", correct * 100.0 / test_dataloader.size, "%")
 
-
 def train_func(net, train_dataloader, opt):
     """train function"""
     net.train(True)
@@ -96,12 +97,10 @@ def demo():
     train_dataloader = MNN.data.DataLoader(train_dataset, batch_size = 64, shuffle = True)
     test_dataloader = MNN.data.DataLoader(test_dataset, batch_size = 100, shuffle = False)
 
-    opt = MNN.optim.SGD(0.01, 0.9, 0.0005)
-    opt.append(model.parameters)
+    opt = MNN.optim.SGD(model, 0.01, 0.9, 0.0005)
 
     F.set_thread_number(4)
-
-    for epoch in range(0, 10):
+    for epoch in range(0, 1):
         opt.learning_rate = learning_rate_scheduler(opt.learning_rate, epoch)
         train_func(model, train_dataloader, opt)
         

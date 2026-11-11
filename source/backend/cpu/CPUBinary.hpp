@@ -10,32 +10,33 @@
 #define CPUBinary_hpp
 
 #include "core/Execution.hpp"
-
+#include "backend/cpu/CPURelu.hpp"
+#include "compute/CommonOptFunction.h"
 namespace MNN {
-
-class CPUBinaryFloat : public Execution {
+class CPUBinary : public Execution {
 public:
-    CPUBinaryFloat(Backend *b, int32_t type);
-    virtual ~CPUBinaryFloat() = default;
+    CPUBinary(Backend *b, MNNBinaryExecute proc, int activationType) : Execution(b) {
+        mProc = proc;
+        mActivationType = activationType;
+    }
+    virtual ~CPUBinary() = default;
     virtual ErrorCode onResize(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override;
     virtual ErrorCode onExecute(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override;
 
-protected:
-    int32_t mType;
-    void (*mElementProc)(float* C, const float* A, const float* B, size_t width, size_t cStride, size_t aStride, size_t bStride, size_t height) = nullptr;
-    bool mSupportScale = false;
-    int mOutside = 1;
-    int mInside = 1;
-    int mAxis = 1;
-};
-class CPUBinaryInt : public Execution {
-public:
-    CPUBinaryInt(Backend *b, int32_t type);
-    virtual ~CPUBinaryInt() = default;
-    virtual ErrorCode onExecute(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override;
-
-protected:
-    int32_t mType;
+    static MNNBinaryExecute selectForFloat(int opType);
+    static MNNBinaryExecute selectForInt(int opType);
+private:
+    MNNBinaryExecute mProc;
+    int mNeedBroadcastIndex = -1;
+    int mTotalSize;
+    int mActivationType = 0;
+    int mThreadNum;
+    int mWorkDiv;
+    std::shared_ptr<Execution> mActivationExe;
+    std::pair<std::function<void(int)>, int> mTask;
+    uint8_t* mInput0Ptr = nullptr;
+    uint8_t* mOutputPtr = nullptr;
+    uint8_t* mInput1Ptr = nullptr;
 };
 } // namespace MNN
 #endif /* CPUBinary_hpp */

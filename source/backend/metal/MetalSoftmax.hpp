@@ -9,21 +9,23 @@
 #ifndef MetalSoftmax_hpp
 #define MetalSoftmax_hpp
 
-#import "core/Execution.hpp"
-#import "MNN_generated.h"
-#import "MetalDefine.h"
-
+#import "MetalExecution.hpp"
 #if MNN_METAL_ENABLED
 namespace MNN {
 
-class MetalSoftmax : public Execution {
+class MetalSoftmax : public MetalExecution {
 public:
     MetalSoftmax(Backend *backend, int32_t axis);
     virtual ~MetalSoftmax() = default;
-    virtual ErrorCode onExecute(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override;
+    virtual ErrorCode onResize(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override;
+    virtual void onEncode(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs, id<MTLComputeCommandEncoder> encoder) override;
 
 private:
     int32_t mAxis;
+    int32_t mAxisLen;
+    id<MTLBuffer> mShapeBuffer;
+    id<MTLComputePipelineState> mPipeline;
+    std::pair<MTLSize, MTLSize> mThreads;
 };
 
 } // namespace MNN

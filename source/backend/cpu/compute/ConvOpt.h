@@ -13,52 +13,30 @@
 #include <stdio.h>
 
 #ifdef __cplusplus
+#include <algorithm>
+
 extern "C" {
 #endif
 
-#define CONVOLUVTION_RUN_BASIC(l, t, r, b, TYPE, alpha)                                                               \
-    for (dy = t; dy < b; ++dy) {                                                                                      \
-        int srcStartY      = dy * strideY - padY;                                                                     \
-        float* dst_y       = dst_z + width * 4 * dy;                                                                  \
-        const TYPE* src_dy = srcOrigin + srcStartY * src_width * 4;                                                   \
-        int sfy            = ALIMAX(0, (UP_DIV(-srcStartY, dilateY)));                                                \
-        int efy            = ALIMIN(kernel_height, UP_DIV(src_height - srcStartY, dilateY));                          \
-        for (dx = l; dx < r; ++dx) {                                                                                  \
-            int srcStartX            = dx * strideX - padX;                                                           \
-            const TYPE* src_dx       = src_dy + 4 * srcStartX;                                                        \
-            float* dst_x             = dst_y + 4 * dx;                                                                \
-            int sfx                  = ALIMAX(0, (UP_DIV(-srcStartX, dilateX)));                                      \
-            int efx                  = ALIMIN(kernel_width, UP_DIV(src_width - srcStartX, dilateX));                  \
-            const TYPE* src_unit     = src_dx + (sfx * dilateX_step + sfy * dilateY_step);                            \
-            const TYPE* weight_start = weight_dz + (16 * sfx + weight_sy_step * sfy);                                 \
-            MNNConvSlideWindowBorder(dst_x, src_unit, weight_start, src_depth_quad, src_z_step, efx - sfx, efy - sfy, \
-                                     weight_sy_step, weight_sz_step, dilateX_step, dilateY_step, alpha);              \
-        }                                                                                                             \
-    }
-
-
-void MNNConvRunForUnitDepthWise(float* dst, const float* src, const float* weight, size_t fw, size_t fh,
-                                size_t weight_y_step, size_t dilateX_step, size_t dilateY_step);
 void MNNConvRunForLineDepthwise(float* dst, const float* src, const float* weight, size_t width, size_t src_w_setup,
                                 size_t fw, size_t fh, size_t dilateX_step, size_t dilateY_step, size_t height,
-                                size_t srcHStep, size_t dstHStep);
+                                size_t srcHStep, size_t dstHStep, const float* bias, const float* parameters);
 
 void MNNDeconvRunForUnitDepthWise(const float* dst, float* src, const float* weight, size_t fw, size_t fh,
                                   size_t weight_y_step, size_t dilateX_step, size_t dilateY_step);
 void MNNDeconvRunForLineDepthwise(const float* dst, float* src, const float* weight, size_t width, size_t src_w_setup,
                                   size_t fw, size_t fh, size_t dilateX_step, size_t dilateY_step);
 
-void MNNGemmFloatUnit_4(float* dst, const float* src, const float* weight, size_t src_depth_quad, size_t dst_step,
-                        size_t dst_depth_quad, size_t weight_depth_offset);
+void MNNDepthwiseConvFastKernel(float* dst, const float* src, const float* weight, size_t width, size_t src_w_setup,
+                                    size_t fw, size_t fh, size_t dilateX_step, size_t dilateY_step, size_t height,
+                                    size_t srcHStep, size_t dstHStep, const float* bias, const float* parameters);
 
-void MNNGemmFloatOne_4(float* dst, const float* src, const float* weight, size_t src_depth_quad, size_t dst_step,
-                       size_t dst_depth_quad, size_t weight_depth_offset);
-void MNNGemmFloatCommon_4(float* dst, const float* src, const float* weight, size_t src_depth_quad, size_t dst_step,
-                          size_t dst_depth_quad, size_t width, size_t weight_depth_offset);
 void MNNMatrixAdd(float* C, const float* A, const float* B, size_t widthC4, size_t cStride, size_t aStride,
                   size_t bStride, size_t height);
 void MNNMatrixSub(float* C, const float* A, const float* B, size_t widthC4, size_t cStride, size_t aStride,
                   size_t bStride, size_t height);
+void MNNStrassenMergeCFunction(float* c11, float* c12, float* c21, float* c22, float* xAddr, size_t cStride,
+                               size_t eSub, size_t hSub);
 void MNNMatrixMax(float* C, const float* A, const float* B, size_t widthC4, size_t cStride, size_t aStride,
                   size_t bStride, size_t height);
 void MNNMatrixProd(float* C, const float* A, const float* B, size_t widthC4, size_t cStride, size_t aStride,
@@ -70,10 +48,49 @@ void MNNMatrixMaxCommon(float* C, const float* A, const float* B, size_t width, 
 
 void MNNMatrixProdCommon(float* C, const float* A, const float* B, size_t width, size_t cStride, size_t aStride, size_t bStride, size_t height);
 
-int MNNGetConvolutionTileNumber();
-
 #ifdef __cplusplus
 }
+
+namespace MNN {
+
+// Source: [channel blocks, 4 kernel positions, tile length, Pack].
+// Output: [channel blocks, batch, 2 * input height, 2 * input width, Pack].
+// parameters: input start, tile length, input width, input height, batch, channel blocks.
+template <typename V, int Pack>
+void deconv2x2Post(const float* src, float* dst, const float* bias, const float* post, const int* parameters) {
+    const int start = parameters[0], count = parameters[1], width = parameters[2], height = parameters[3];
+    const int batch = parameters[4], channels = parameters[5];
+    const V zero(0.0f), lower(post[2]), upper(post[3]);
+    for (int offset = 0; offset < count;) {
+        const int index = start + offset;
+        const int b = index / (width * height);
+        const int iy = (index % (width * height)) / width;
+        const int ix = index % width;
+        const int length = std::min(count - offset, width - ix);
+        for (int z = 0; z < channels; ++z) {
+            auto s = src + (z * 4 * count + offset) * Pack;
+            auto d = dst + (((z * batch + b) * height * 2 + iy * 2) * width * 2 + ix * 2) * Pack;
+            const auto biasValue = V::load(bias + z * Pack);
+            for (int fy = 0; fy < 2; ++fy) {
+                auto left = s + fy * 2 * count * Pack;
+                auto right = left + count * Pack;
+                auto row = d + fy * width * 2 * Pack;
+                for (int x = 0; x < length; ++x) {
+                    // Keep the original add-to-zero, bias, and clamp order.
+                    auto a = V::load(left + x * Pack) + zero;
+                    auto b0 = V::load(right + x * Pack) + zero;
+                    a = V::max(V::min(a + biasValue, upper), lower);
+                    b0 = V::max(V::min(b0 + biasValue, upper), lower);
+                    V::save(row + 2 * x * Pack, a);
+                    V::save(row + (2 * x + 1) * Pack, b0);
+                }
+            }
+        }
+        offset += length;
+    }
+}
+
+} // namespace MNN
 #endif
 
 #endif /* ConvOpt_h */

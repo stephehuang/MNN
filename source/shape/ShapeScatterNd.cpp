@@ -7,30 +7,42 @@
 //
 
 
+#include "shape/SizeComputer.hpp"
 #include "core/Macro.h"
-#include "core/SizeComputer.hpp"
 
 namespace MNN {
 // Size Computer
 class ShapeScatterNd : public SizeComputer {
     bool onComputeSize(const MNN::Op *op, const std::vector<Tensor *> &inputs,
                        const std::vector<Tensor *> &outputs) const override {
-        MNN_ASSERT(3 == inputs.size());
+        MNN_ASSERT(3 <= inputs.size());
         auto indices = inputs[0];
         auto updates = inputs[1];
         auto shape   = inputs[2];
         auto output  = outputs[0];
-        MNN_CHECK(shape->dimensions() == 1, "shape rank should be one");
+        //MNN_CHECK(shape->dimensions() == 1, "shape rank should be one");
         const int indicesDimension = indices->dimensions();
-        MNN_CHECK(indices->length(indicesDimension - 1) == 1, "indices.shape[-1] = shape.rank");
-
-        const int outerDims = indicesDimension - 1;
-        for (int i = 0; i < outerDims; ++i) {
-            MNN_CHECK(indices->length(i) == updates->length(i), "indices shape does not match updates'");
+        const int dimension = shape->length(0);
+        // Validate: indices last dim must not exceed output rank.
+        // (indices[..., K] requires K <= output rank; K < rank means slice update,
+        //  which is legal. Only K > rank is invalid.)
+        if (indices->length(indicesDimension - 1) > dimension) {
+            MNN_ERROR("ScatterNd: indices last dim (%d) > output rank (%d)\n",
+                      indices->length(indicesDimension - 1), dimension);
+            return false;
         }
 
-        const int dimension = shape->length(0);
-        MNN_CHECK(updates->dimensions() == dimension, "updates dimension should be equal to given shape");
+        const int outerDims = indicesDimension - 1;
+        // Validate: updates outer dims must match indices outer dims
+        int indicesOuterSize = 1;
+        for (int i = 0; i < outerDims; ++i) {
+            indicesOuterSize *= indices->length(i);
+        }
+        if (updates->elementSize() < indicesOuterSize) {
+            MNN_ERROR("ScatterNd: updates size (%d) < indices outer size (%d)\n",
+                      updates->elementSize(), indicesOuterSize);
+            return false;
+        }
 
         output->buffer().dimensions = dimension;
 

@@ -13,21 +13,34 @@
 
 #if MNN_METAL_ENABLED
 namespace MNN {
-
+struct TransformBuffer {
+    int inputSize[4];
+    int outputSize[4];
+    int padX;
+    int padY;
+    int unitWidth;
+    int unitHeight;
+    int unit;
+    int activation;
+    int remain[2];
+};
 class MetalConvolutionWinograd : public MetalConvolutionCommon {
 public:
-    static bool isValid(const Convolution2D *conv, const Tensor *input);
-    MetalConvolutionWinograd(Backend *backend, const Tensor *input, const MNN::Op *op);
+    static bool isValid(Backend *backend, const Convolution2D *conv, const Tensor *input, const Tensor* output);
+    MetalConvolutionWinograd(Backend *backend, const MNN::Op *op);
     virtual ~MetalConvolutionWinograd() = default;
     virtual ErrorCode onResize(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override;
 
+    virtual bool onClone(Backend* bn, const Op* op, Execution** dst) override;
+
 protected:
-    virtual ErrorCode onQuantized(const Tensor *input, const Tensor *output) override;
-    virtual ErrorCode onFloat(const Tensor *input, const Tensor *output) override;
-    virtual id<MTLBuffer> weightForQuantized(int group, int oc, int ic, int kh, int kw, const int8_t *src) override;
-    virtual id<MTLBuffer> weightForFloat(int group, int oc, int ic, int kh, int kw, const float *src) override;
+    virtual void onEncode(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs, id<MTLComputeCommandEncoder> encoder) override;
+    virtual std::shared_ptr<MNN::Tensor> weightTransform(int group, int oc, int ic, int kh, int kw, const float *src, bool int8Weight=false, bool int4Weight=false, id<MTLBuffer> srcGpuBuffer=nil, int subBits=0) override;
 
 private:
+    MetalConvolutionWinograd(Backend *backend, const MNN::Op *op, std::shared_ptr<Tensor> weight, std::shared_ptr<Tensor> bias);
+
+    
     id<MTLBuffer> mShapeBuffer = nil;
 
     int mSrcUnit;
@@ -39,6 +52,7 @@ private:
     MTLSize mInputTransformThreads;
     MTLSize mMatMulThreads;
     MTLSize mOutputTransformThreads;
+    int mSplitNum = 1;
 };
 
 } // namespace MNN

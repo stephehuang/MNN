@@ -9,6 +9,7 @@
 #ifndef BufferPool_hpp
 #define BufferPool_hpp
 
+#include <set>
 #include <map>
 #include <memory>
 #include <vector>
@@ -17,50 +18,59 @@
 
 namespace MNN {
 namespace OpenCL {
+struct OpenCLBufferNode{
+    OpenCLBufferNode(){};
+    size_t size;
+    std::shared_ptr<cl::Buffer> buffer;
+};
+
 class BufferPool : public NonCopyable {
 public:
     BufferPool(cl::Context& context, cl_mem_flags flags) : mContext(context) {
         mFlag = flags;
     }
 
-    cl::Buffer* alloc(int size, bool seperate = false);
+    cl::Buffer* alloc(size_t size, bool separate = false);
     void recycle(cl::Buffer* buffer, bool release = false);
     void clear();
-
-    struct Node {
-        int size;
-        std::shared_ptr<cl::Buffer> buffer;
-    };
+    void releaseFreeList();
+    size_t totalSize() { return mTotalSize; }
+    // Bytes still held by the driver, recycled buffers included: they stay alive until
+    // releaseFreeList or clear. Unlike mTotalSize this shrinks when memory is handed back,
+    // so it is what getSessionInfo(MEMORY) should report.
+    size_t residentSize() const;
 
 private:
-    std::map<cl::Buffer*, std::shared_ptr<Node>> mAllBuffer;
-    std::multimap<int, std::shared_ptr<Node>> mFreeList;
+    std::map<cl::Buffer*, std::shared_ptr<OpenCLBufferNode>> mAllBuffer;
+    std::multimap<size_t, std::shared_ptr<OpenCLBufferNode>> mFreeList;
 
     cl::Context& mContext;
     cl_mem_flags mFlag;
+    size_t mTotalSize = 0;
 };
-class BufferPoolInt8 : public NonCopyable {
+
+class BufferExecutionPool : public NonCopyable {
 public:
-    BufferPoolInt8(cl::Context& context, cl_mem_flags flags) : mContext(context) {
+    BufferExecutionPool(cl::Context& context, cl::CommandQueue& command, cl_mem_flags flags) : mContext(context), mCommand(command) {
         mFlag = flags;
     }
 
-    cl::Buffer* alloc(int size, bool seperate = false);
-    void recycle(cl::Buffer* buffer, bool release = false);
+    std::shared_ptr<OpenCLBufferNode> alloc(size_t size, bool separate = false);
+    void recycle(std::shared_ptr<OpenCLBufferNode> node, bool release = false);
     void clear();
-
-    struct Node {
-        int size;
-        std::shared_ptr<cl::Buffer> buffer;
-    };
-
+    void releaseFreeList();
+    size_t totalSize() { return mTotalSize; }
+    size_t residentSize() const;
 private:
-    std::map<cl::Buffer*, std::shared_ptr<Node>> mAllBuffer;
-    std::multimap<int, std::shared_ptr<Node>> mFreeList;
+    std::set<std::shared_ptr<OpenCLBufferNode>> mAllBuffer;
+    std::multimap<size_t, std::shared_ptr<OpenCLBufferNode>> mFreeList;
 
     cl::Context& mContext;
+    cl::CommandQueue& mCommand;
     cl_mem_flags mFlag;
+    size_t mTotalSize = 0;
 };
+
 } // namespace OpenCL
 } // namespace MNN
 

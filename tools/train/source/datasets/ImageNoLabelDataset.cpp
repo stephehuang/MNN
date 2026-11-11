@@ -1,3 +1,11 @@
+//
+//  ImageNoLabelDataset.cpp
+//  MNN
+//
+//  Created by MNN on 2020/02/16.
+//  Copyright © 2018, Alibaba Group Holding Limited
+//
+
 #if defined(_MSC_VER)
 #include <Windows.h>
 #undef min
@@ -8,7 +16,6 @@
 #include <sys/types.h>
 #include <dirent.h>
 #endif
-#define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
 #include "ImageNoLabelDataset.hpp"
@@ -64,6 +71,9 @@ static void _readImages(std::vector<std::string>& images, const std::string& fil
         ent = readdir(root);
     }
 #endif
+    if (images.size() == 0) {
+        MNN_ERROR("Don't find any file in %s\n", filePath.c_str());
+    }
 }
 
 

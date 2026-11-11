@@ -5,17 +5,32 @@
 //  Created by MNN on 2020/04/28.
 //  Copyright © 2018, Alibaba Group Holding Limited
 //
-#ifdef __aarch64__
-#include "backend/arm82/Arm82Interp.hpp"
+#if defined(__ANDROID__) || defined(__aarch64__)
+
+#include "Arm82Interp.hpp"
+#include "Arm82OptFunc.hpp"
 #include <math.h>
 #include "core/Concurrency.h"
 #include "core/Macro.h"
-
 #ifdef MNN_USE_NEON
 #include <arm_neon.h>
 #endif
 
 namespace MNN {
+
+static void Arm82NearestUnit(FLOAT16* dst, const FLOAT16* src, const int* position, int width) {
+    for (int i = 0; i < width; ++i) {
+#ifdef MNN_USE_NEON
+        float16x8_t nn_value   = vld1q_f16(src + ARMV82_CHANNEL_UNIT * position[2 * i]);
+        vst1q_f16(dst + ARMV82_CHANNEL_UNIT * i, nn_value);
+#else
+        for (int k = 0; k < ARMV82_CHANNEL_UNIT; ++k) {
+            int index = i * ARMV82_CHANNEL_UNIT + k;
+            dst[index] = src[ARMV82_CHANNEL_UNIT * position[2 * i] + k];
+        }
+#endif
+    }
+}
 
 static void Arm82BilinearSampleCUnit(const FLOAT16* src, FLOAT16* dst, const int* position, const FLOAT16* factor,
                                      int width) {
@@ -67,14 +82,13 @@ static inline int CLAMP(int a, int min, int max) {
     return a;
 }
 
-Arm82Interp::Arm82Interp(Backend* backend, float widthScale, float heightScale, int resizeType, bool AlignCorners,
-                         bool halfPixelCenters)
+Arm82Interp::Arm82Interp(Backend* backend, float widthScale, float heightScale, int resizeType, float widthOffset, float heightOffset)
     : Execution(backend),
       mWidthScale(widthScale),
       mHeightScale(heightScale),
       mResizeType(resizeType),
-      mAlignCorners(AlignCorners),
-      mHalfPixelCenters(halfPixelCenters) {
+      mWidthOffset(widthOffset),
+      mHeightOffset(heightOffset) {
 }
 
 Arm82Interp::~Arm82Interp() {
@@ -89,79 +103,54 @@ ErrorCode Arm82Interp::onResize(const std::vector<Tensor*>& inputs, const std::v
     const int ow = output->width();
     const int oh = output->height();
 
-    if (mAlignCorners) {
-        if (oh == 1) {
-            mHeightScale = 0.0f;
-        } else {
-            mHeightScale = (float)(ih - 1) / (float)(oh - 1);
-        }
-
-        if (ow == 1) {
-            mWidthScale = 0.0f;
-        } else {
-            mWidthScale = (float)(iw - 1) / (float)(ow - 1);
-        }
-    } else {
-        mHeightScale = (float)(ih) / (float)(oh);
-        mWidthScale  = (float)(iw) / (float)(ow);
-    }
-
     const float xScaling                  = mWidthScale;
     const float yScaling                  = mHeightScale;
     mWidthPosition.buffer().dim[0].extent = 2 * ow;
     mWidthPosition.buffer().dimensions    = 1;
     mWidthPosition.setType(DataType_DT_INT32);
-    backend()->onAcquireBuffer(&mWidthPosition, Backend::DYNAMIC_SEPERATE);
+    backend()->onAcquireBuffer(&mWidthPosition, Backend::STATIC);
 
     mWidthFactor.buffer().dim[0].extent = ow;
     mWidthFactor.buffer().dimensions    = 1;
-    mWidthFactor.setType(DataType_DT_INT16);
-    backend()->onAcquireBuffer(&mWidthFactor, Backend::DYNAMIC_SEPERATE);
+    mWidthFactor.setType(DataType_DT_INT32);
+    backend()->onAcquireBuffer(&mWidthFactor, Backend::STATIC);
 
     auto _wPositionPtr = mWidthPosition.host<int>();
-    auto _wFactorPtr   = mWidthFactor.host<FLOAT16>();
+    auto _wFactorPtr   = mWidthFactor.host<float>();
 
     for (int x = 0; x < ow; ++x) {
-        FLOAT16 srcX;
-        if (mHalfPixelCenters) {
-            srcX = (x + 0.5) * xScaling - 0.5;
-        } else {
-            srcX = x * xScaling;
-        }
-        int x1                   = floor(srcX);
-        FLOAT16 x2Factor         = srcX - x1;
+        float srcX = x * xScaling + mWidthOffset;
+        float x1                   = floor(srcX);
+        float x2Factor         = srcX - x1;
         _wFactorPtr[x]           = x2Factor;
         _wPositionPtr[2 * x + 0] = CLAMP(x1, 0, iw - 1);
         _wPositionPtr[2 * x + 1] = CLAMP(x1 + 1, 0, iw - 1);
     }
+    MNNQuantizeFP16(mWidthFactor.host<float>(), mWidthFactor.host<int16_t>(), ow);
 
     mHeightPosition.buffer().dim[0].extent = 2 * oh;
     mHeightPosition.buffer().dimensions    = 1;
     mHeightPosition.setType(DataType_DT_INT32);
-    backend()->onAcquireBuffer(&mHeightPosition, Backend::DYNAMIC_SEPERATE);
+    backend()->onAcquireBuffer(&mHeightPosition, Backend::STATIC);
 
     mHeightFactor.buffer().dim[0].extent = oh;
     mHeightFactor.buffer().dimensions    = 1;
-    mHeightFactor.setType(DataType_DT_INT16);
-    backend()->onAcquireBuffer(&mHeightFactor, Backend::DYNAMIC_SEPERATE);
+    mHeightFactor.setType(DataType_DT_INT32);
+    backend()->onAcquireBuffer(&mHeightFactor, Backend::STATIC);
 
     auto _hPositionPtr = mHeightPosition.host<int>();
-    auto _hFactorPtr   = mHeightFactor.host<FLOAT16>();
+    auto _hFactorPtr   = mHeightFactor.host<float>();
 
     for (int y = 0; y < oh; ++y) {
-        FLOAT16 srcY;
-        if (mHalfPixelCenters) {
-            srcY = (y + 0.5) * yScaling - 0.5;
-        } else {
-            srcY = y * yScaling;
-        }
+        float srcY = y * yScaling + mHeightOffset;
 
         int y1                   = floor(srcY);
-        FLOAT16 y2Factor         = srcY - y1;
+        float y2Factor         = srcY - y1;
         _hFactorPtr[y]           = y2Factor;
         _hPositionPtr[2 * y + 0] = CLAMP(y1, 0, ih - 1);
         _hPositionPtr[2 * y + 1] = CLAMP(y1 + 1, 0, ih - 1);
     }
+    MNNQuantizeFP16(mHeightFactor.host<float>(), mHeightFactor.host<int16_t>(), oh);
 
     mTheadNumbers = static_cast<Arm82Backend*>(backend())->numberThread();
 
@@ -184,11 +173,38 @@ ErrorCode Arm82Interp::onExecute(const std::vector<Tensor*>& inputs, const std::
     const int oh                  = output->height();
     const int inputBatchStride    = iw * ih * ARMV82_CHANNEL_UNIT;
     const int outputBatchStride   = ow * oh * ARMV82_CHANNEL_UNIT;
-    const int inputChannelStride  = iw * ih;
-    const int outputChannelStride = ow * oh;
+    const int inputChannelStride  = iw * ih * batches;
+    const int outputChannelStride = ow * oh * batches;
     const int channelDivUnit      = UP_DIV(input->channel(), ARMV82_CHANNEL_UNIT);
 
-    if (mResizeType == 2) {
+    if (mResizeType == 1) {
+        const auto widthPositionPtr  = mWidthPosition.host<int>();
+        const auto heightPositionPtr = mHeightPosition.host<int>();
+
+        for (int b = 0; b < batches; ++b) {
+            const auto curInputBatchPtr = input->host<FLOAT16>() + b * inputBatchStride;
+            auto curOutputBatchPtr      = output->host<FLOAT16>() + b * outputBatchStride;
+
+            auto threadFucntion = [&](size_t tId, const FLOAT16* src, FLOAT16* dst) {
+                for (int n = (int)tId; n < channelDivUnit; n += mTheadNumbers) {
+                    const auto curSrc = src + n * ARMV82_CHANNEL_UNIT * inputChannelStride;
+                    auto curDst       = dst + n * ARMV82_CHANNEL_UNIT * outputChannelStride;
+
+                    for (int h = 0; h < oh; ++h) {
+                        int yPosition = heightPositionPtr[2 * h];
+                        Arm82NearestUnit(curDst + ow * h * ARMV82_CHANNEL_UNIT, 
+                                         curSrc + yPosition * iw * ARMV82_CHANNEL_UNIT, 
+                                         widthPositionPtr,
+                                         ow);
+                    }
+                }
+            };
+
+            MNN_CONCURRENCY_BEGIN(tId, mTheadNumbers)
+            threadFucntion(tId, curInputBatchPtr, curOutputBatchPtr);
+            MNN_CONCURRENCY_END();
+        }
+    } else if (mResizeType == 2) {
         const auto widthPositionPtr  = mWidthPosition.host<int>();
         const auto widthFactorPtr    = mWidthFactor.host<FLOAT16>();
         const auto heightPositionPtr = mHeightPosition.host<int>();
@@ -252,11 +268,7 @@ ErrorCode Arm82Interp::onExecute(const std::vector<Tensor*>& inputs, const std::
 
             MNN_CONCURRENCY_BEGIN(tId, mTheadNumbers)
             threadFucntion(tId, curInputBatchPtr, curOutputBatchPtr);
-#ifdef MNN_USE_THREAD_POOL
-            MNN_CONCURRENCY_ARM82_END();
-#else
             MNN_CONCURRENCY_END();
-#endif
         }
     } else {
         return NOT_SUPPORT;
@@ -265,21 +277,17 @@ ErrorCode Arm82Interp::onExecute(const std::vector<Tensor*>& inputs, const std::
     return NO_ERROR;
 }
 
-class Arm82InterpCreator : public Arm82Backend::Arm82Creator {
-    virtual Execution* onCreate(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs,
-                                const MNN::Op* op, Backend* backend) const {
-        auto param = op->main_as_Interp();
-        // TODO, support other resize types
-        if(param->resizeType() != 2){
-            return nullptr;
-        }
-        return new Arm82Interp(backend, param->widthScale(), param->heightScale(), param->resizeType(),
-                               param->alignCorners(), param->halfPixelCenters());
+Execution* Arm82Interp::create(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs,
+                         const MNN::Op* op, Backend* backend) {
+    auto param = op->main_as_Interp();
+    // nearest and bilinear are supported
+    // TODO, support other resize types
+    if(param->resizeType() != 2 && param->resizeType() != 1){
+        return nullptr;
     }
-};
-
-REGISTER_ARM82_OP_CREATOR(OpType_Interp, Arm82InterpCreator);
-
+    return new Arm82Interp(backend, param->widthScale(), param->heightScale(), param->resizeType(),
+                           param->widthOffset(), param->heightOffset());
+}
 } // namespace MNN
 
 #endif

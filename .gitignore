@@ -2,6 +2,9 @@
 # Created by https://www.gitignore.io/api/python,cmake,xcode,androidstudio
 # Edit at https://www.gitignore.io/?templates=python,cmake,xcode,androidstudio
 
+# Local build, export, and device-test artifacts.
+/.artifacts/
+
 ### AndroidStudio ###
 # Covers files to be ignored for android development using Android Studio.
 
@@ -24,6 +27,7 @@ out/
 .gradle
 .gradle/
 build/
+buildvisionOs/
 
 # Signing files
 .signing/
@@ -147,7 +151,7 @@ CTestTestfile.cmake
 ### Python ###
 # Byte-compiled / optimized / DLL files
 __pycache__/
-*.py[cod]
+*.py[od]
 *$py.class
 
 # C extensions
@@ -234,6 +238,7 @@ celerybeat-schedule
 
 # Environments
 .env
+.copybara_sync.env
 .venv
 env/
 venv/
@@ -330,7 +335,6 @@ project/android/.idea/caches/build_file_checksums.ser
 # FIXME(haijing): Xcode pre-build stage breaks compilation of flatbuffers by setting envs that do cmake cross-compilation for iOS
 # schema/current
 schema/private
-schema/current
 tools/converter/source/IR
 benchmark/benchmark.txt
 
@@ -345,21 +349,68 @@ pymnn/android/.idea/modules.xml
 pymnn/android/.idea/runConfigurations.xml
 pymnn/android/.idea/vcs.xml
 pymnn/android/.idea/caches/build_file_checksums.ser
+pymnn/src/pybind_private/
 
 buildios
 build*/
 include/MNN/VCS.h
-source/backend/opencl/execution/cl/codegen/opencl_program.cc
-source/backend/opencl/execution/cl/opencl_program.cc
-# FIXME(haijing): MTL issues.....
-# source/backend/metal/MetalOPRegister.mm
 source/backend/opengl/AllShader.cpp
 include/MNN/backend/opengl/shaders/AllShader.h
-source/backend/vulkan/compiler/AllShader.cpp
-include/MNN/backend/vulkan/shaders/AllShader.h
 .idea
 project/ios/ios_64
 project/ios/ios_32
 project/ios/MNN.framework
 
 pymnn_build/
+
+# mnncompress generated
+MNN_compression_pb2.py
+project/ios/MNNLLMForiOS/MNN.framework
+project/MNNLLMForiOS/Chat
+project/MNNLLMForiOS/MNN.framework
+MNN-iOS-CPU-GPU/Static/MNN.framework
+apps/iOS/MNNLLMChat/MNN.framework
+
+# datasets
+datasets/*
+!datasets/*.sh
+
+# qnn 3rdParty
+source/backend/qnn/3rdParty/include
+project/android/.cxx
+pymnn/android/.cxx/
+pymnn/android/.cxx/abi_configuration_5u53tc49.jsonz
+apps/mnncli/.cursorrules
+apps/mnncli/model_market_json_data.inc
+#kledi
+_deps
+#aicoding
+.cursor
+
+# llm model
+transformers/llm/export/model/
+apps/Android/.qoder/settings.json
+apps/Android/MnnLlmChatOld
+
+transformers/llm/export/tmp/
+
+# iOS
+apps/iOS/MNNLLMChat/Chat/
+apps/iOS/MNNLLMChat/swift-transformers/
+apps/iOS/MNNLLMChat/MNNLLMiOS/LocalModel/Qwen3-4B-MNN
+apps/iOS/MNNLLMChat/MNNLLMiOS/LocalModel/Qwen3-0.6B-MNN
+apps/iOS/MNNLLMChat/MNNLLMiOS/LocalModel/Qwen2.5-Omni-3B-MNN
+
+# oneday scoder
+.oneday/
+
+# test.sh per-run artifacts
+/logs/
+/smoke_sources/
+/models/
+# smoke models converted on the host by ./test.sh local (sources are fetched
+# into /smoke_sources/, then MNNConvert writes the .caffe.mnn here)
+/resource/model/**/*.caffe.mnn
+
+model/
+.qoder

@@ -7,147 +7,255 @@
 //
 
 #import "backend/metal/MetalBinary.hpp"
+#import "MetalEnv.hpp"
 #import "backend/metal/MNNMetalContext.h"
 #import "core/Macro.h"
+#import "core/TensorUtils.hpp"
 #import "backend/metal/MetalBackend.hpp"
+#import "backend/metal/MetalConvolution1x1.hpp"
 
 #if MNN_METAL_ENABLED
 namespace MNN {
 
-MetalBinary::MetalBinary(Backend *backend, int binarytype) : Execution(backend) {
-    auto context = (__bridge MNNMetalContext *)static_cast<MetalBackend *>(backend)->context();
-    mBinaryType  = [context newDeviceBuffer:sizeof(int) bytes:&binarytype access:CPUWriteOnly];
+MetalBinary::MetalBinary(Backend *backend, id<MTLComputePipelineState> pipeline, id<MTLComputePipelineState> plane,
+                         int opType, int activationType) : MetalExecution(backend) {
+    auto mtbn = static_cast<MetalBackend *>(backend);
+    auto context = (__bridge MNNMetalContext *)mtbn->context();
+    mConstBuffer             = [context newDeviceBuffer:4 * sizeof(int) access:CPUWriteOnly];
+    mPipeline = pipeline;
+    mPlanePipeline = plane;
+    mOpType = opType;
+    mActivationType = activationType;
 }
-
-ErrorCode MetalBinary::onExecute(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) {
+ErrorCode MetalBinary::onResize(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) {
     auto backend = static_cast<MetalBackend *>(this->backend());
     auto context = (__bridge MNNMetalContext *)backend->context();
     auto input0 = inputs[0], input1 = inputs[1], output = outputs[0];
-    const int input0_data_count = (int)input0->elementSize();
-    const int input1_data_count = (int)input1->elementSize();
+    const int input0_data_count = TensorUtils::getRawSize(input0);
+    const int input1_data_count = TensorUtils::getRawSize(input1);
+    mUsePlane = false;
 
-    // scalar support
-    int iw0 = input0->width(), ih0 = input0->height();
-    int iw1 = input1->width(), ih1 = input1->height();
-    int ow = output->width(), oh = output->height(), oc = output->channel(), ob = output->batch();
-    iw0 = iw0 == 0 ? 1 : iw0;
-    ih0 = ih0 == 0 ? 1 : ih0;
-    iw1 = iw1 == 0 ? 1 : iw1;
-    ih1 = ih1 == 0 ? 1 : ih1;
-    ow  = ow == 0 ? 1 : ow;
-    oh  = oh == 0 ? 1 : oh;
-    oc  = oc == 0 ? 1 : oc;
-    ob  = ob == 0 ? 1 : ob;
-
-    bool same_shape = true;
-    // scalar input
-    if (inputs[0]->buffer().dimensions == 0 || inputs[1]->buffer().dimensions == 0) {
-        // do nothing
-    }
-    // same shape
-    else if (inputs[0]->buffer().dimensions == inputs[1]->buffer().dimensions) {
-        for (int i = 0; i < inputs[0]->buffer().dimensions; i++) {
-            if (inputs[0]->buffer().dim[i].extent != inputs[1]->buffer().dim[i].extent) {
-                same_shape = false;
-                break;
-            }
-        }
-    }
-    // different shape
-    else {
-        same_shape = false;
-    }
-
-    // encode
-    auto output_dimensions = output->buffer().dimensions;
-    auto shape             = [context newDeviceBuffer:6 * sizeof(int) access:CPUWriteOnly];
-    auto encoder           = [context encoder];
-    if (same_shape == false) {
-        // dim
-        auto dimsIn0Buffer = [context newDeviceBuffer:sizeof(int) * output_dimensions access:CPUWriteOnly];
-        auto dimsIn1Buffer = [context newDeviceBuffer:sizeof(int) * output_dimensions access:CPUWriteOnly];
-        int *dims0         = (int *)dimsIn0Buffer.contents;
-        int *dims1         = (int *)dimsIn1Buffer.contents;
-        for (int i = 0; i < output_dimensions; i++) {
-            dims0[i] = dims1[i] = 1;
-        }
-        for (int i = input0->buffer().dimensions - 1, j = output_dimensions - 1; i >= 0; i--, j--) {
-            dims0[j] = input0->buffer().dim[i].extent;
-        }
-        for (int i = input1->buffer().dimensions - 1, j = output_dimensions - 1; i >= 0; i--, j--) {
-            dims1[j] = input1->buffer().dim[i].extent;
-        }
-
-        // strides & shape
-        auto stridesIn0Buffer = [context newDeviceBuffer:sizeof(int) * output_dimensions access:CPUWriteOnly];
-        auto stridesIn1Buffer = [context newDeviceBuffer:sizeof(int) * output_dimensions access:CPUWriteOnly];
-        auto stridesOutBuffer = [context newDeviceBuffer:sizeof(int) * output_dimensions access:CPUWriteOnly];
-        int *input0_strides   = (int *)stridesIn0Buffer.contents;
-        int *input1_strides   = (int *)stridesIn1Buffer.contents;
-        int *output_strides   = (int *)stridesOutBuffer.contents;
-        int input_data_count0 = 1, input_data_count1 = 1;
-        int output_data_count = 1;
-        for (int i = output_dimensions - 1; i >= 0; i--) {
-            input0_strides[i] = input_data_count0;
-            input_data_count0 *= dims0[i];
-            input1_strides[i] = input_data_count1;
-            input_data_count1 *= dims1[i];
-            output_strides[i] = output_data_count;
-            output_data_count *= output->buffer().dim[i].extent;
-        }
-        ((int *)shape.contents)[0] = input0_data_count;
-        ((int *)shape.contents)[1] = input1_data_count;
-        ((int *)shape.contents)[2] = output_data_count;
-        ((int *)shape.contents)[3] = ow;
-        ((int *)shape.contents)[4] = ow * oh;
-        ((int *)shape.contents)[5] = output_dimensions;
-
-        // encode
-        auto bandwidth = [context load:@"binary_notshape" encoder:encoder];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)(void *)input0->deviceId() offset:0 atIndex:0];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)(void *)input1->deviceId() offset:0 atIndex:1];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)(void *)output->deviceId() offset:0 atIndex:2];
-        [encoder setBuffer:shape offset:0 atIndex:3];
-        [encoder setBuffer:mBinaryType offset:0 atIndex:4];
-        [encoder setBuffer:dimsIn0Buffer offset:0 atIndex:5];
-        [encoder setBuffer:dimsIn1Buffer offset:0 atIndex:6];
-        [encoder setBuffer:stridesIn0Buffer offset:0 atIndex:7];
-        [encoder setBuffer:stridesIn1Buffer offset:0 atIndex:8];
-        [encoder setBuffer:stridesOutBuffer offset:0 atIndex:9];
-        [context dispatchEncoder:encoder threads:{ (NSUInteger) output_data_count, 1, 1 } bandwidth:bandwidth];
-    } else {
-        int outdatacount = 0;
-        if (input0_data_count == input1_data_count) {
-            outdatacount = input0_data_count;
-        } else {
-            outdatacount = input0_data_count > input1_data_count ? input0_data_count : input1_data_count;
-        }
-        ((int *)shape.contents)[0] = input0_data_count;
-        ((int *)shape.contents)[1] = input1_data_count;
-        ((int *)shape.contents)[2] = outdatacount;
-        ((int *)shape.contents)[3] = ow;
-        ((int *)shape.contents)[4] = ow * oh;
-        ((int *)shape.contents)[5] = output_dimensions;
-
-        auto bandwidth = [context load:@"binary_normal" encoder:encoder];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)(void *)input0->deviceId() offset:0 atIndex:0];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)(void *)input1->deviceId() offset:0 atIndex:1];
-        [encoder setBuffer:(__bridge id<MTLBuffer>)(void *)output->deviceId() offset:0 atIndex:2];
-        [encoder setBuffer:shape offset:0 atIndex:3];
-        [encoder setBuffer:mBinaryType offset:0 atIndex:4];
-        [context dispatchEncoder:encoder threads:{ (NSUInteger) outdatacount, 1, 1 } bandwidth:bandwidth];
-    }
-
-    [encoder endEncoding];
-    MNN_PRINT_ENCODER(context, encoder);
+    int outdatacount = output->elementSize();
+    ((int *)mConstBuffer.contents)[0] = input0_data_count == 1 ? 0 : 1;
+    ((int *)mConstBuffer.contents)[1] = input1_data_count == 1 ? 0 : 1;
+    ((int *)mConstBuffer.contents)[2] = outdatacount;
+    mUsePlane = input0_data_count != 1 && input1_data_count != 1;
+    mThreads = [context computeBestGroupAndLocal:mPipeline threads:MTLSizeMake(outdatacount, 1, 1)];
     return NO_ERROR;
 }
 
+void MetalBinary::onEncode(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs, id<MTLComputeCommandEncoder> encoder) {
+    auto input0 = inputs[0], input1 = inputs[1], output = outputs[0];
+    if (mUsePlane) {
+        [encoder setComputePipelineState:mPlanePipeline];
+    } else {
+        [encoder setComputePipelineState:mPipeline];
+    }
+    MetalBackend::setTensor(input0, encoder, 0);
+    MetalBackend::setTensor(input1, encoder, 1);
+    MetalBackend::setTensor(output, encoder, 2);
+    [encoder setBuffer:mConstBuffer offset:0 atIndex:3];
+    [encoder dispatchThreadgroups:mThreads.first threadsPerThreadgroup:mThreads.second];
+}
+
+#define CHECK(t, i) if (originOp == t) return i;
+NSString* MetalBinary::convert(int originOp, bool inputFloat) {
+    if (BinaryOpOperation_MOD == originOp) {
+        if (inputFloat) {
+            return @"fmod((float)V0,(float)V1)";
+        }
+        /**
+         auto res = x % y;
+         if ((res < 0 && y > 0) || (res > 0 && y < 0)) {
+             res += y;
+         }
+         */
+        return @"select(V0%V1,(V0%V1)+V1,(V0%V1<0&&V1>0)||(V0%V1>0&&V1<0))";
+    }
+    if (BinaryOpOperation_MUL_SILU == originOp) {
+        if (!inputFloat) {
+            return nil;
+        }
+        return @"V0*(V1/(1.0f+exp(-V1)))";
+    }
+    CHECK(BinaryOpOperation_ADD, @"V0+V1");
+    CHECK(BinaryOpOperation_ATAN2, @"atan2(V0,V1)");
+    CHECK(BinaryOpOperation_SUB, @"V0-V1");
+    CHECK(BinaryOpOperation_MUL, @"V0*V1");
+    CHECK(BinaryOpOperation_FLOORMOD, @"V0-floor((float)V0/(float)V1)*V1");
+    CHECK(BinaryOpOperation_FLOORDIV, @"floor((float)V0/(float)V1)");
+    CHECK(BinaryOpOperation_MINIMUM, @"min(V0,V1)");
+    CHECK(BinaryOpOperation_MAXIMUM, @"max(V0,V1)");
+    CHECK(BinaryOpOperation_DIV, @"V1==0?0:V0/V1");
+    CHECK(BinaryOpOperation_REALDIV, @"V1==0?0:V0/V1");
+    CHECK(BinaryOpOperation_POW, @"pow(V0,V1)");
+    CHECK(BinaryOpOperation_SquaredDifference, @"(V0-V1)*(V0-V1)");
+    CHECK(BinaryOpOperation_EQUAL, @"(V0==V1)?1:0");
+    CHECK(BinaryOpOperation_LESS, @"(V0<V1)?1:0");
+    CHECK(BinaryOpOperation_LESS_EQUAL, @"(V0<=V1)?1:0");
+    CHECK(BinaryOpOperation_GREATER, @"(V0>V1)?1:0");
+    CHECK(BinaryOpOperation_GREATER_EQUAL, @"(V0>=V1)?1:0");
+    CHECK(BinaryOpOperation_NOTEQUAL, @"(V0!=V1)?1:0");
+    CHECK(BinaryOpOperation_LOGICALOR, @"V0||V1");
+    CHECK(BinaryOpOperation_BITWISE_AND, @"V0&V1");
+    CHECK(BinaryOpOperation_BITWISE_OR, @"V0|V1");
+    CHECK(BinaryOpOperation_BITWISE_XOR, @"V0^V1");
+    return nil;
+}
+
+static const char* gBinaryTemplate = R"metal(
+#include <metal_stdlib>
+#include <simd/simd.h>
+using namespace metal;
+kernel void binary(const device T0 *in0 [[buffer(0)]],
+    const device T1 *in1 [[buffer(1)]], device T2 *out [[buffer(2)]], constant int4& s [[buffer(3)]], uint gid [[thread_position_in_grid]]) {
+    if ((int)gid >= s.z) return;
+#ifdef SAME_SIZE
+    auto V0 = in0[int(gid)];
+    auto V1 = in1[int(gid)];
+#else
+    auto V0 = in0[s.x * int(gid)];
+    auto V1 = in1[s.y * int(gid)];
+#endif
+    auto val = CUSTOM;
+#ifdef RELU
+    val = (val < (T2)0 ? (T2)0 : val);
+#endif
+    out[int(gid)] = val;
+}
+)metal";
+
+static const char* gMulSiluVecTemplate = R"metal(
+#include <metal_stdlib>
+#include <simd/simd.h>
+using namespace metal;
+kernel void mulsilu_vec(const device T *in0 [[buffer(0)]],
+    const device T *in1 [[buffer(1)]], device T *out [[buffer(2)]], constant int& size [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]) {
+    if ((int)gid >= size) {
+        return;
+    }
+    float4 gate = float4(in1[int(gid)]);
+    float4 up = float4(in0[int(gid)]);
+    out[int(gid)] = (T)(up * (gate / (1.0f + exp(-gate))));
+}
+)metal";
+
+class MetalMulSiluVec : public MetalExecution {
+public:
+    MetalMulSiluVec(Backend *backend, id<MTLComputePipelineState> pipeline) : MetalExecution(backend) {
+        auto mtbn = static_cast<MetalBackend *>(backend);
+        auto context = (__bridge MNNMetalContext *)mtbn->context();
+        mConstBuffer = [context newDeviceBuffer:sizeof(int) access:CPUWriteOnly];
+        mPipeline = pipeline;
+    }
+    virtual ErrorCode onResize(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override {
+        auto backend = static_cast<MetalBackend *>(this->backend());
+        auto context = (__bridge MNNMetalContext *)backend->context();
+        auto input0DataCount = TensorUtils::getRawSize(inputs[0]);
+        auto input1DataCount = TensorUtils::getRawSize(inputs[1]);
+        auto outputDataCount = TensorUtils::getRawSize(outputs[0]);
+        if (input0DataCount != outputDataCount || input1DataCount != outputDataCount || outputDataCount % 4 != 0) {
+            return NOT_SUPPORT;
+        }
+        ((int *)mConstBuffer.contents)[0] = outputDataCount / 4;
+        mThreads = [context computeBestGroupAndLocal:mPipeline threads:MTLSizeMake(outputDataCount / 4, 1, 1)];
+
+        return NO_ERROR;
+    }
+    virtual void onEncode(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs,
+                          id<MTLComputeCommandEncoder> encoder) override {
+        [encoder setComputePipelineState:mPipeline];
+        MetalBackend::setTensor(inputs[0], encoder, 0);
+        MetalBackend::setTensor(inputs[1], encoder, 1);
+        MetalBackend::setTensor(outputs[0], encoder, 2);
+        [encoder setBuffer:mConstBuffer offset:0 atIndex:3];
+        [encoder dispatchThreadgroups:mThreads.first threadsPerThreadgroup:mThreads.second];
+    }
+
+private:
+    id<MTLBuffer> mConstBuffer;
+    id<MTLComputePipelineState> mPipeline;
+    std::pair<MTLSize, MTLSize> mThreads;
+};
+
 class MetalBinaryCreator : public MetalBackend::Creator {
 public:
-    virtual Execution *onCreate(const std::vector<Tensor *> &inputs, const MNN::Op *op, Backend *backend) const {
+    virtual Execution *onCreate(const std::vector<Tensor *> &inputs, const MNN::Op *op, Backend *backend, const std::vector<Tensor *>& outputs) const {
         auto binaryop = op->main_as_BinaryOp();
-        return new MetalBinary(backend, binaryop->opType());
+        auto mtbn = static_cast<MetalBackend *>(backend);
+        if (inputs.size() != 2) {
+            return nullptr;
+        }
+        if (binaryop->opType() == BinaryOpOperation_MUL_SILU && binaryop->activationType() == 0 &&
+            inputs[0]->getType().code == halide_type_float && inputs[1]->getType().code == halide_type_float &&
+            outputs[0]->getType().code == halide_type_float &&
+            TensorUtils::getDescribe(inputs[0])->dimensionFormat == MNN_DATA_FORMAT_NC4HW4 &&
+            TensorUtils::getDescribe(inputs[1])->dimensionFormat == MNN_DATA_FORMAT_NC4HW4 &&
+            TensorUtils::getDescribe(outputs[0])->dimensionFormat == MNN_DATA_FORMAT_NC4HW4 &&
+            TensorUtils::getRawSize(inputs[0]) == TensorUtils::getRawSize(outputs[0]) &&
+            TensorUtils::getRawSize(inputs[1]) == TensorUtils::getRawSize(outputs[0]) &&
+            TensorUtils::getRawSize(outputs[0]) % 4 == 0) {
+            NSString* T = MetalCast::getVecType(outputs[0]->getType(), mtbn->useFp16InsteadFp32());
+            std::vector<std::string> keys = {std::string([T UTF8String]), "mulsilu_vec4_binary"};
+            auto pipeline = mtbn->runtime()->findPipeline(keys);
+            if (nil == pipeline) {
+                MTLCompileOptions *compileOptions = [[MTLCompileOptions alloc] init];
+                compileOptions.preprocessorMacros = @{@"T" : T};
+                pipeline = mtbn->makeComputePipelineWithSourceOption(gMulSiluVecTemplate, "mulsilu_vec", compileOptions);
+                mtbn->runtime()->insertPipeline(keys, pipeline);
+            }
+            if (nil == pipeline) {
+                MNN_ERROR("Make MUL_SILU vec4 shader error\n");
+                return nullptr;
+            }
+            return new MetalMulSiluVec(backend, pipeline);
+        }
+        NSString* T2 = MetalCast::getScalarType(outputs[0]->getType(), mtbn->useFp16InsteadFp32());
+        NSString* T0 = MetalCast::getScalarType(inputs[0]->getType(), mtbn->useFp16InsteadFp32());
+        NSString* T1 = MetalCast::getScalarType(inputs[1]->getType(), mtbn->useFp16InsteadFp32());
+        MTLCompileOptions *compileOptions = [[MTLCompileOptions alloc] init];
+        auto dic = [NSMutableDictionary dictionaryWithCapacity:0];
+        std::vector<std::string> keys = {
+            std::string([T0 UTF8String]),
+            std::string([T1 UTF8String]),
+            std::string([T2 UTF8String]),
+            std::to_string(binaryop->opType()),
+            "binary"
+        };
+        [dic setValue:T0 forKey:@"T0"];
+        [dic setValue:T1 forKey:@"T1"];
+        [dic setValue:T2 forKey:@"T2"];
+        if (binaryop->activationType() == 1) {
+            keys.emplace_back("RELU");
+            [dic setValue:@"1" forKey:@"RELU"];
+        }
+        auto pipeline = mtbn->runtime()->findPipeline(keys);
+        auto plane = pipeline;
+        if (nil == pipeline) {
+            NSString* custom = MetalBinary::convert(binaryop->opType(), inputs[0]->getType().code == halide_type_float);
+            if (nil == custom) {
+                MNN_ERROR("Metal Don't support binary - %d \n", binaryop->opType());
+                return nullptr;
+            }
+            [dic setValue:custom forKey:@"CUSTOM"];
+            compileOptions.preprocessorMacros = dic;
+            pipeline = mtbn->makeComputePipelineWithSourceOption(gBinaryTemplate, "binary", compileOptions);
+            mtbn->runtime()->insertPipeline(keys, pipeline);
+            keys.emplace_back("PLANE");
+            [dic setValue:@"1" forKey:@"SAME_SIZE"];
+            compileOptions.preprocessorMacros = dic;
+            plane = mtbn->makeComputePipelineWithSourceOption(gBinaryTemplate, "binary", compileOptions);
+            mtbn->runtime()->insertPipeline(keys, plane);
+        } else {
+            keys.emplace_back("PLANE");
+            plane = mtbn->runtime()->findPipeline(keys);
+        }
+        if (nil == pipeline) {
+            MNN_ERROR("Make Binary shader error\n");
+            return nullptr;
+        }
+        return new MetalBinary(backend, pipeline, plane, (int)binaryop->opType(), (int)binaryop->activationType());
     }
 };
 REGISTER_METAL_OP_CREATOR(MetalBinaryCreator, OpType_BinaryOp);

@@ -44,11 +44,10 @@ public:
         convOption.stride     = {2, 2};
         convOption.dilate     = {1, 2};
         convOption.padMode = SAME;
-        auto convModule       = NN::Conv(convOption);
+        std::shared_ptr<Module> convModule(NN::Conv(convOption));
 
-        std::shared_ptr<SGD> sgd(new SGD);
+        std::shared_ptr<SGD> sgd(new SGD(convModule));
         sgd->setLearningRate(0.01f);
-        sgd->append(convModule->parameters());
         std::vector<float> randomInputs(1 * ic * ih * iw);
         for (int i = 0; i < randomInputs.size(); ++i) {
             randomInputs[i] = ((float)(gDevice() % 2000) - 1000.0f) / 1000.0f;
@@ -107,11 +106,10 @@ public:
         convOption.stride     = {2, 2};
         convOption.dilate     = {1, 2};
         convOption.depthwise  = true;
-        auto convModule       = NN::Conv(convOption);
+        std::shared_ptr<Module> convModule(NN::Conv(convOption));
 
-        std::shared_ptr<SGD> sgd(new SGD);
+        std::shared_ptr<SGD> sgd(new SGD(convModule));
         sgd->setLearningRate(0.1f);
-        sgd->append(convModule->parameters());
         sgd->setWeightDecay(0.0f);
         sgd->setMomentum(0.0f);
 
@@ -178,11 +176,11 @@ public:
         convOption.kernelSize = {kw, kh};
         convOption.stride     = {2, 2};
         convOption.dilate     = {1, 2};
-        auto convModule       = NN::ConvTranspose(convOption);
+        std::shared_ptr<Module> convModule(NN::ConvTranspose(convOption));
 
         convOption.depthwise = true;
         convOption.channel   = {oc, oc};
-        auto convModule2     = NN::ConvTranspose(convOption, false);
+        std::shared_ptr<Module> convModule2(NN::ConvTranspose(convOption, false));
         VARP weightTarget2;
         {
             int weightSize = oc * kw * kh;
@@ -194,9 +192,8 @@ public:
             weightTarget2 = _Const(targetVecs.data(), {oc, 1, kh, kw}, NCHW);
         }
 
-        std::shared_ptr<ADAM> sgd(new ADAM);
+        std::shared_ptr<ADAM> sgd(new ADAM(convModule));
         sgd->setLearningRate(0.01f);
-        sgd->append(convModule->parameters());
         std::vector<float> randomInputs(1 * ic * ih * iw);
         for (int i = 0; i < randomInputs.size(); ++i) {
             randomInputs[i] = ((float)(gDevice() % 2000) - 1000.0f) / 1000.0f;
@@ -205,11 +202,13 @@ public:
         for (int i = 0; i < 1000; ++i) {
             auto input    = _Input({1, ic, ih, iw}, NCHW);
             auto inputPtr = input->writeMap<float>();
+            input = _Convert(input, NC4HW4);
             ::memcpy(inputPtr, randomInputs.data(), randomInputs.size() * sizeof(float));
 
-            auto targetValue  = _Deconv(weightTarget, biasTarget, _Convert(input, NC4HW4), convOption.padMode,
+            auto targetValue  = _Deconv(weightTarget, biasTarget, input, convOption.padMode,
                                        convOption.stride, convOption.dilate);
             auto predictValue = convModule->forward(input);
+
             targetValue       = _Deconv(weightTarget2, nullptr, targetValue, convOption.padMode, convOption.stride,
                                   convOption.dilate, oc);
             predictValue      = convModule2->forward(predictValue);
@@ -248,9 +247,9 @@ public:
             }
             auto weightTarget = _Const(targetVecs.data(), {l, h}, NCHW);
             auto weightOrigin = _TrainableParam(0.01f, {l, h}, NCHW);
-            std::shared_ptr<SGD> sgd(new SGD);
+            std::shared_ptr<Module> _m(Module::createEmpty({weightOrigin}));
+            std::shared_ptr<SGD> sgd(new SGD(_m));
             sgd->setLearningRate(0.01f);
-            sgd->append({weightOrigin});
             std::vector<float> randomInputs(e * l);
             for (int i = 0; i < randomInputs.size(); ++i) {
                 randomInputs[i] = ((float)(gDevice() % 2000) - 1000.0f) / 1000.0f;
@@ -284,15 +283,15 @@ public:
             }
             auto weightTarget = _Const(targetVecs.data(), {b, l, h}, NCHW);
             auto weightOrigin = _TrainableParam(0.01f, {b, l, h}, NCHW);
-            std::shared_ptr<ADAM> sgd(new ADAM);
+            std::shared_ptr<Module> _m(Module::createEmpty({weightOrigin}));
+            std::shared_ptr<ADAM> sgd(new ADAM(_m));
             sgd->setLearningRate(0.01f);
-            sgd->append({weightOrigin});
             std::vector<float> randomInputs(b * e * l);
             for (int i = 0; i < randomInputs.size(); ++i) {
                 randomInputs[i] = ((float)(gDevice() % 2000) - 1000.0f) / 1000.0f;
             }
 
-            for (int i = 0; i < 10000; ++i) {
+            for (int i = 0; i < 1000; ++i) {
                 auto input    = _Input({b, e, l}, NCHW);
                 auto inputPtr = input->writeMap<float>();
                 ::memcpy(inputPtr, randomInputs.data(), randomInputs.size() * sizeof(float));
@@ -302,7 +301,118 @@ public:
                 targetValue       = _Relu6(targetValue);
                 predictValue      = _Relu6(predictValue);
                 auto loss         = _ReduceMean(_Square(_Subtract(targetValue, predictValue)), {});
-                if (i % 1000 == 0) {
+                if (i % 100 == 0) {
+                    MNN_PRINT("Loss = %f\n", loss->readMap<float>()[0]);
+                }
+                sgd->step(loss);
+            }
+        }
+        MNN_PRINT("Test for BroadCastMatMul\n");
+        {
+            int e          = 13;
+            int l          = 11;
+            int h          = 30;
+            int b          = 5;
+            int weightSize = 1 * l * h;
+            std::vector<float> targetVecs(weightSize);
+            for (int i = 0; i < weightSize; ++i) {
+                auto v        = ((float)(gDevice() % 2000) - 1000.0f) / 1000.0f;
+                targetVecs[i] = v;
+            }
+            auto weightTarget = _Const(targetVecs.data(), {1, l, h}, NCHW);
+            auto weightOrigin = _TrainableParam(0.01f, {1, l, h}, NCHW);
+            std::shared_ptr<Module> _m(Module::createEmpty({weightOrigin}));
+            std::shared_ptr<ADAM> sgd(new ADAM(_m));
+            sgd->setLearningRate(0.01f);
+            std::vector<float> randomInputs(b * e * l);
+            for (int i = 0; i < randomInputs.size(); ++i) {
+                randomInputs[i] = ((float)(gDevice() % 2000) - 1000.0f) / 1000.0f;
+            }
+            for (int i = 0; i < 1000; ++i) {
+                auto input    = _Input({b, e, l}, NCHW);
+                auto inputPtr = input->writeMap<float>();
+                ::memcpy(inputPtr, randomInputs.data(), randomInputs.size() * sizeof(float));
+
+                auto targetValue  = _MatMul(input, weightTarget);
+                auto predictValue = _MatMul(input, weightOrigin);
+                targetValue       = _Relu6(targetValue);
+                predictValue      = _Relu6(predictValue);
+                auto loss         = _ReduceMean(_Square(_Subtract(targetValue, predictValue)), {});
+                if (i % 100 == 0) {
+                    MNN_PRINT("Loss = %f\n", loss->readMap<float>()[0]);
+                }
+                sgd->step(loss);
+            }
+        }
+        return 0;
+    }
+};
+class LoopGradTest : public DemoUnit {
+public:
+    virtual int run(int argc, const char* argv[]) override {
+        MNN_PRINT("Test grad for Loop Binary\n");
+        {
+            int w = 4;
+            int h = 5;
+            auto input = _Input({w, h}, NHWC);
+            auto target = _Input({w, h}, NHWC);
+            auto targetAdd = _Input({w, h}, NHWC);
+            auto inputPtr = input->writeMap<float>();
+            auto targetPtr = target->writeMap<float>();
+            auto targetPtrAdd = targetAdd->writeMap<float>();
+            for (int y=0; y<h; ++y) {
+                for (int x=0; x<w; ++x) {
+                    auto value = ((float) (y * w) + (float)x) * 0.1f;
+                    inputPtr[x + y * w] = value;
+                    targetPtr[x + y * w] = value * (float) (y + 1) * 0.1f;
+                    targetPtrAdd[x + y * w] = value + (float) (y + 1) * 0.1f;
+                }
+            }
+            
+            auto weight = _TrainableParam(0.0f, {1, h}, NHWC);
+            auto weightAdd = _TrainableParam(0.0f, {1, h}, NHWC);
+            std::shared_ptr<Module> _m(Module::createEmpty({weight, weightAdd}));
+            std::shared_ptr<SGD> sgd(new SGD(_m));
+            sgd->setLearningRate(0.01f);
+            MNN_PRINT("Test grad for Binary Mul Loop\n");
+            for (int i = 0; i < 1000; ++i) {
+                auto compute = input * weight;
+                auto loss = _ReduceMean(_Square(_Subtract(compute, target)), {});
+                if (i % 100 == 0) {
+                    MNN_PRINT("Loss = %f\n", loss->readMap<float>()[0]);
+                }
+                sgd->step(loss);
+            }
+            MNN_PRINT("Test grad for Binary Add Loop\n");
+            for (int i = 0; i < 1000; ++i) {
+                auto compute = input + weightAdd;
+                auto loss = _ReduceMean(_Square(_Subtract(compute, target)), {});
+                if (i % 100 == 0) {
+                    MNN_PRINT("Loss = %f\n", loss->readMap<float>()[0]);
+                }
+                sgd->step(loss);
+            }
+        }
+        MNN_PRINT("Test grad for Gather\n");
+        {
+            // set input data
+            const float inpudata[] = {1.0,  2.0,  3.0,  4.0,  5.0,  6.0,  7.0,  8.0, 9.0, 10.0, 11.0, 12.0, 13.0,
+                                      14.0, 15.0, 16.0, 17.0, 18.0, 19.0, 20.0, 21,  0,   22.0, 23.0, 24.0};
+            std::vector<float> inputDataRaw(0.0f, sizeof(inpudata) / sizeof(float));
+            auto params = _TrainableParam(inputDataRaw.data(), {4, 3, 2}, NCHW, halide_type_of<float>());
+            const int indices_data[]                = {1, 0, 1, 0};
+            const std::vector<float> expectedOutput = {7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0,
+                                                       7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0};
+            std::shared_ptr<Module> _m(Module::createEmpty({params}));
+            std::shared_ptr<SGD> sgd(new SGD(_m));
+            sgd->setLearningRate(0.01f);
+            for (int i = 0; i < 1000; ++i) {
+                auto indices                            = _Const(indices_data, {4}, NCHW, halide_type_of<int>());
+                auto output                             = _GatherV2(params, indices, nullptr);
+                output = _Reshape(output, {-1});
+                auto predictValue = _Const(expectedOutput.data(), {(int)expectedOutput.size()}, NCHW);
+                auto loss         = _ReduceMean(_Square(_Subtract(output, predictValue)), {});
+                if (i % 100 == 0) {
                     MNN_PRINT("Loss = %f\n", loss->readMap<float>()[0]);
                 }
                 sgd->step(loss);
@@ -316,3 +426,4 @@ DemoUnitSetRegister(NNGrad, "NNGrad");
 DemoUnitSetRegister(NNGradV2, "NNGradV2");
 DemoUnitSetRegister(NNGradV3, "NNGradV3");
 DemoUnitSetRegister(MatMulGradTest, "MatMulGradTest");
+DemoUnitSetRegister(LoopGradTest, "LoopGradTest");

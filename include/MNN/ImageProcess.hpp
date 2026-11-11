@@ -6,8 +6,8 @@
 //  Copyright © 2018, Alibaba Group Holding Limited
 //
 
-#ifndef ImageProcess_hpp
-#define ImageProcess_hpp
+#ifndef MNN_ImageProcess_hpp
+#define MNN_ImageProcess_hpp
 
 #include <MNN/ErrorCode.hpp>
 #include <MNN/Matrix.h>
@@ -16,14 +16,21 @@
 namespace MNN {
 namespace CV {
 enum ImageFormat {
-    RGBA = 0,
-    RGB,
-    BGR,
-    GRAY,
-    BGRA,
+    RGBA     = 0,
+    RGB      = 1,
+    BGR      = 2,
+    GRAY     = 3,
+    BGRA     = 4,
+    YCrCb    = 5,
+    YUV      = 6,
+    HSV      = 7,
+    XYZ      = 8,
+    BGR555   = 9,
+    BGR565   = 10,
     YUV_NV21 = 11,
     YUV_NV12 = 12,
     YUV_I420 = 13,
+    HSV_FULL = 14,
 };
 
 enum Filter { NEAREST = 0, BILINEAR = 1, BICUBIC = 2 };
@@ -37,6 +44,7 @@ enum Wrap { CLAMP_TO_EDGE = 0, ZERO = 1, REPEAT = 2 };
  *  2: Sample line and do format convert
  *  3: Turn RGBA to float tensor, and do sub and normalize
  */
+
 class MNN_PUBLIC ImageProcess {
 public:
     struct Inside;
@@ -55,7 +63,6 @@ public:
         /** edge wrapper */
         Wrap wrap = CLAMP_TO_EDGE;
     };
-
 public:
     /**
      * @brief create image process with given config for given tensor.
@@ -79,9 +86,10 @@ public:
     static ImageProcess* create(const ImageFormat sourceFormat = RGBA, const ImageFormat destFormat = RGBA,
                                 const float* means = nullptr, const int meanCount = 0, const float* normals = nullptr,
                                 const int normalCount = 0, const Tensor* dstTensor = nullptr);
-
+    
     ~ImageProcess();
-
+    static void destroy(ImageProcess* imageProcess);
+    
     /**
      * @brief get affine transform matrix.
      * @return affine transform matrix.
@@ -90,7 +98,7 @@ public:
         return mTransform;
     }
     void setMatrix(const Matrix& matrix);
-
+    
     /**
      * @brief convert source data to given tensor.
      * @param source    source data.
@@ -101,7 +109,7 @@ public:
      * @return result code.
      */
     ErrorCode convert(const uint8_t* source, int iw, int ih, int stride, Tensor* dest);
-
+    
     /**
      * @brief convert source data to given tensor.
      * @param source    source data.
@@ -118,7 +126,7 @@ public:
      */
     ErrorCode convert(const uint8_t* source, int iw, int ih, int stride, void* dest, int ow, int oh, int outputBpp = 0,
                       int outputStride = 0, halide_type_t type = halide_type_of<float>());
-
+    
     /**
      * @brief create tensor with given data.
      * @param w     image width.
@@ -132,14 +140,43 @@ public:
         return createImageTensor(halide_type_of<T>(), w, h, bpp, p);
     }
     static Tensor* createImageTensor(halide_type_t type, int w, int h, int bpp, void* p = nullptr);
-
+    
+    /**
+     * @brief set padding value when wrap=ZERO.
+     * @param value     padding value.
+     * @return void.
+     */
+    void setPadding(uint8_t value) {
+        mPaddingValue = value;
+    }
+    
+    /**
+     * @brief set to draw mode.
+     * @param void
+     * @return void.
+     */
+    void setDraw();
+    
+    /**
+     * @brief draw color to regions of img.
+     * @param img  the image to draw.
+     * @param w  the image's width.
+     * @param h  the image's height.
+     * @param c  the image's channel.
+     * @param regions  the regions to draw, size is [num * 3] contain num x { y, xl, xr }
+     * @param num  regions num
+     * @param color  the color to draw.
+     * @return void.
+     */
+    void draw(uint8_t* img, int w, int h, int c, const int* regions, int num, const uint8_t* color);
 private:
     ImageProcess(const Config& config);
     Matrix mTransform;
     Matrix mTransformInvert;
     Inside* mInside;
+    uint8_t mPaddingValue = 0;
 };
 } // namespace CV
 } // namespace MNN
 
-#endif /* ImageProcess_hpp */
+#endif /* MNN_ImageProcess_hpp */

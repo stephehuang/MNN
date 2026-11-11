@@ -5,9 +5,9 @@
 //  Created by MNN on 2018/10/23.
 //  Copyright © 2018, Alibaba Group Holding Limited
 //
-#ifdef MNN_SUPPORT_TFLITE_QUAN
-#include "backend/cpu/CPUQuanConvolutionDepthwise.hpp"
 #include "backend/cpu/CPUBackend.hpp"
+#ifdef MNN_SUPPORT_DEPRECATED_OP
+#include "backend/cpu/CPUQuanConvolutionDepthwise.hpp"
 #include "backend/cpu/CPUFixedPoint.hpp"
 #include "backend/cpu/CPUQuantizationUtils.hpp"
 #include "backend/cpu/compute/CommonOptFunction.h"
@@ -201,16 +201,16 @@ ErrorCode CPUQuanConvolutionDepthwise::onResize(const std::vector<Tensor*>& inpu
 
     // Compute Mid Rect
     ml = 0; mt = 0; mr = outputWidth; mb = outputHeight;
-    for (; ml * mStrideW - mPaddingWidth < 0; ml++) {
+    for (; ml * mStrideW - mPaddingWidth < 0 && ml < outputWidth; ml++) {
         // do nothing
     }
-    for (; mt * mStrideH - mPaddingHeight < 0; mt++) {
+    for (; mt * mStrideH - mPaddingHeight < 0 && mt < outputHeight; mt++) {
         // do nothing
     }
-    for (; (mr - 1) * mStrideW - mPaddingWidth + filterWidth * mDilateX > inputWidth && mr > ml; mr--) {
+    for (; (mr - 1) * mStrideW - mPaddingWidth + (filterWidth - 1) * mDilateX >= inputWidth && mr > ml; mr--) {
         // do nothing
     }
-    for (; (mb - 1) * mStrideH - mPaddingHeight + filterHeight * mDilateY > inputHeight && mb > mt; mb--) {
+    for (; (mb - 1) * mStrideH - mPaddingHeight + (filterHeight - 1) * mDilateY >= inputHeight && mb > mt; mb--) {
         // do nothing
     }
 
@@ -306,6 +306,8 @@ public:
         return new CPUQuanConvolutionDepthwise(backend, op);
     }
 };
-REGISTER_CPU_OP_CREATOR(CPUDepthwiseCreator, OpType_QuantizedDepthwiseConv2D);
 } // namespace MNN
 #endif
+namespace MNN {
+REGISTER_CPU_OP_CREATOR_OLD(CPUDepthwiseCreator, OpType_QuantizedDepthwiseConv2D);
+};

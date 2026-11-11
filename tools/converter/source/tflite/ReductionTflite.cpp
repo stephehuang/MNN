@@ -3,24 +3,24 @@
 //  MNNConverter
 //
 //  Created by MNN on 2019/12/09.
-//  Copyright © 2019, Alibaba Group Holding Limited
+//  Copyright © 2018, Alibaba Group Holding Limited
 //
 
 #include <stdio.h>
 #include "liteOpConverter.hpp"
 
 DECLARE_OP_COVERTER(ReductionTflite);
-MNN::OpType ReductionTflite::opType(bool quantizedModel) {
+MNN::OpType ReductionTflite::opType(int quantizedModel) {
     return MNN::OpType_Reduction;
 }
-MNN::OpParameter ReductionTflite::type(bool quantizedModel) {
+MNN::OpParameter ReductionTflite::type(int quantizedModel) {
     return MNN::OpParameter_ReductionParam;
 }
 
 void ReductionTflite::run(MNN::OpT* dstOp, const std::unique_ptr<tflite::OperatorT>& tfliteOp,
                          const std::vector<std::unique_ptr<tflite::TensorT>>& tfliteTensors,
                          const std::vector<std::unique_ptr<tflite::BufferT>>& tfliteModelBuffer,
-                         const std::vector<std::unique_ptr<tflite::OperatorCodeT>>& tfliteOpSet, bool quantizedModel){
+                         const std::vector<std::unique_ptr<tflite::OperatorCodeT>>& tfliteOpSet, int quantizedModel){
   auto param = new MNN::ReductionParamT;
   auto opt = tfliteOp->builtin_options.AsReducerOptions();
   param->keepDims=opt->keep_dims;
@@ -37,7 +37,7 @@ void ReductionTflite::run(MNN::OpT* dstOp, const std::unique_ptr<tflite::Operato
     }
   }
 #endif
-  switch(tfliteOpSet[tfliteOp->opcode_index]->builtin_code){
+  switch(liteOpConverter::getOpCode(tfliteOpSet[tfliteOp->opcode_index].get())){
     case tflite::BuiltinOperator_SUM:{
       param->operation=MNN::ReductionType_SUM;
       break;

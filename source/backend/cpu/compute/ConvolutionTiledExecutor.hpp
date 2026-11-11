@@ -9,58 +9,53 @@
 #ifndef ConvolutionTiledExecutor_hpp
 #define ConvolutionTiledExecutor_hpp
 
+
 #include <functional>
 #include "backend/cpu/CPUConvolution.hpp"
 // Tiled Slide Window or Im2Col + GEMM
 namespace MNN {
-class ConvolutionTiledExecutorBasic : public CPUConvolution {
+class ConvolutionTiledImpl : public CPUConvolution {
 public:
-    ConvolutionTiledExecutorBasic(const Convolution2DCommon *common, Backend *b) : CPUConvolution(common, b) {
+    ConvolutionTiledImpl(const Convolution2DCommon *common, Backend *b) : CPUConvolution(common, b) {
+        // Do nothing
     }
-    virtual ~ConvolutionTiledExecutorBasic() = default;
+    virtual ~ConvolutionTiledImpl() = default;
     virtual ErrorCode onExecute(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override;
     virtual ErrorCode onResize(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override;
+    virtual void getPackParameter(int* eP, int* lP, int* hP, const CoreFunctions* core) = 0;
 
 protected:
-    Tensor mTempBuffer;
     Tensor mTempBufferTranspose;
-    std::pair<int, std::function<void(int)>> mFunction;
+    ConvolutionCommon::Im2ColParameter mIm2ColParameters;
+    std::pair<std::function<void(int)>, int> mFunction;
+    const CPUConvolution::Resource* mResource = nullptr;
 };
-class ConvolutionTiledExecutorMultiInput : public Execution {
-public:
-    ConvolutionTiledExecutorMultiInput(const Convolution2DCommon *common, Backend *b) : Execution(b) {
-        mProxy.reset(new ConvolutionTiledExecutorBasic(common, b));
-    }
-    virtual ~ConvolutionTiledExecutorMultiInput() = default;
-    virtual ErrorCode onExecute(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override;
-    virtual ErrorCode onResize(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override;
 
-private:
-    std::shared_ptr<Tensor> mTempWeight;
-    std::shared_ptr<Tensor> mTempWeightCache;
-    std::shared_ptr<Tensor> mTempBias;
-    std::shared_ptr<ConvolutionTiledExecutorBasic> mProxy;
-    std::vector<Tensor *> mInputs;
-};
 class ConvolutionTiledExecutor : public Execution {
 public:
-    ConvolutionTiledExecutor(const Convolution2DCommon *common, Backend *b, const float *originWeight,
-                             size_t originWeightSize, const float *bias, size_t biasSize);
+    ConvolutionTiledExecutor(Backend* b, const float* bias, size_t biasSize);
+    ConvolutionTiledExecutor(std::shared_ptr<CPUConvolution::Resource> res, Backend* b);
     virtual ~ConvolutionTiledExecutor();
+
     virtual ErrorCode onExecute(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override {
-        return mProxy->onExecute(inputs, outputs);
+        return NO_EXECUTION;
     }
     virtual ErrorCode onResize(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override {
-        mInputs = {inputs[0], mWeight.get(), mBias.get()};
-        return mProxy->onResize(mInputs, outputs);
+        return NO_EXECUTION;
     }
+    virtual bool onClone(Backend* bn, const Op* op, Execution** dst) override;
+    void initWeight(const float *source, float* cache, int depth, int outputCount, int kernelSize, const CoreFunctions* function);
+    static std::pair<int, bool> turnIm2ColToBlitInfo(float const ** srcPtr, int32_t* el, int start, int xC, const ConvolutionCommon::Im2ColParameter& im2Col, const uint8_t* srcOrigin, int bytes);
+    static void setIm2ColParameter(ConvolutionCommon::Im2ColParameter& dstIm2ColParamter, const Convolution2DCommon* convCommon, Tensor* input, Tensor* output, int padX, int padY, const CoreFunctions* floatCore, const CoreInt8Functions* int8Core, int pack = 0, int32_t* int8GemmUnit = nullptr);
+    // Total / Stride
+    static std::pair<size_t, std::pair<size_t, size_t>> computeBlitInfoSize(int eP, int ow, int kernelSize, int threadNumber);
 
 protected:
-    std::shared_ptr<Tensor> mWeight;
-    std::shared_ptr<Tensor> mBias;
-    std::shared_ptr<ConvolutionTiledExecutorBasic> mProxy;
     std::vector<Tensor *> mInputs;
+    std::shared_ptr<CPUConvolution::Resource> mResource;
 };
+
+
 } // namespace MNN
 
 #endif /* ConvolutionTiledExecutor_hpp */

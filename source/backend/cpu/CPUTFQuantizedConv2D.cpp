@@ -5,15 +5,14 @@
 //  Created by MNN on 2018/08/02.
 //  Copyright © 2018, Alibaba Group Holding Limited
 //
-#ifdef MNN_SUPPORT_TFLITE_QUAN
+#include "backend/cpu/CPUBackend.hpp"
+#ifdef MNN_SUPPORT_DEPRECATED_OP
 #include "backend/cpu/CPUTFQuantizedConv2D.hpp"
 #include <math.h>
-#include "backend/cpu/CPUBackend.hpp"
 #include "backend/cpu/CPUFixedPoint.hpp"
 #include "backend/cpu/CPUQuantizationUtils.hpp"
 #include "backend/cpu/compute/CommonOptFunction.h"
 #include "core/Concurrency.h"
-#include "core/Macro.h"
 #include "core/TensorUtils.hpp"
 
 #ifdef MNN_USE_NEON
@@ -26,8 +25,11 @@
 //SRC_UNIT/UNIT
 #define SRC_C4_UNIT 4
 
+// ugly macro compatible with MNNGemmInt8ToFloat32_XX
+#ifdef DST_XUNIT
+#undef DST_XUNIT
+#endif
 // One Tile Compute DST_XUNIT * outputChannel 's number
-
 #ifdef __aarch64__
 #define DST_XUNIT 4
 #else
@@ -144,7 +146,7 @@ CPUTFQuantizedConv2D::CPUTFQuantizedConv2D(Backend* backend, const Op* TFQuantiz
     int inputChannel                 = mTfQuantizedConv2D_param->weight()->size() / outputChannel / kx / ky;
     auto outputChannelUnit           = UP_DIV(outputChannel, UNIT);
     auto inputChannelUnit            = UP_DIV(inputChannel, UNIT);
-    mIm2ColParamter                  = new CPUConvolution::Im2ColParameter;
+    mIm2ColParamter                  = new ConvolutionCommon::Im2ColParameter;
     mIm2ColParamter->dilateX         = mTfQuantizedConv2D_param->common()->dilateX();
     mIm2ColParamter->dilateY         = mTfQuantizedConv2D_param->common()->dilateY();
     mIm2ColParamter->strideX         = mTfQuantizedConv2D_param->common()->strideX();
@@ -323,7 +325,7 @@ ErrorCode CPUTFQuantizedConv2D::onResize(const std::vector<Tensor*>& inputs, con
 
 static void _im2ColCommon(int32_t* inputSum, int8_t* colAddr, const uint8_t* inputOrigin,
                           const CPUTFQuantizedConv2D::QuanParameter* quanParamter,
-                          const CPUConvolution::Im2ColParameter* im2ColParameter, size_t xIndexStart,
+                          const ConvolutionCommon::Im2ColParameter* im2ColParameter, size_t xIndexStart,
                           size_t realDstCount) {
     int colBufferSize = im2ColParameter->kernelCountUnit * DST_XUNIT * SRC_UNIT * sizeof(uint8_t);
     ::memset(colAddr, (int8_t)quanParamter->mInputOffset, colBufferSize);
@@ -480,6 +482,8 @@ public:
         return new CPUTFQuantizedConv2D(backend, op);
     }
 };
-REGISTER_CPU_OP_CREATOR(CPUTFQuantizedConv2DCreator, OpType_TfQuantizedConv2D);
 } // namespace MNN
 #endif
+namespace MNN {
+REGISTER_CPU_OP_CREATOR_OLD(CPUTFQuantizedConv2DCreator, OpType_TfQuantizedConv2D);
+}

@@ -9,24 +9,26 @@
 #ifndef MetalReduction_hpp
 #define MetalReduction_hpp
 
-#import "core/Execution.hpp"
+#import "MetalExecution.hpp"
 #import "MNN_generated.h"
-#import "MetalDefine.h"
 
 #if MNN_METAL_ENABLED
 namespace MNN {
 
-class MetalReduction : public Execution {
+class MetalReduction : public MetalExecution {
 public:
     MetalReduction(Backend *backend, const ReductionParam *reduction);
     virtual ~MetalReduction() = default;
     virtual ErrorCode onResize(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override;
-    virtual ErrorCode onExecute(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override;
+    virtual void onEncode(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs, id<MTLComputeCommandEncoder> encoder) override;
 
 private:
-    NSString *mKernel;
-    std::vector<std::shared_ptr<Tensor>> mMiddles;
-    std::vector<int> mDims;
+    int mAxis;
+    id<MTLComputePipelineState> mPipeline;
+    std::pair<MTLSize, MTLSize> mThreads;
+    id<MTLBuffer> mConst;
+    bool mUseSimdReduce = false;
+    ReductionType mReduceType;
 };
 
 } // namespace MNN

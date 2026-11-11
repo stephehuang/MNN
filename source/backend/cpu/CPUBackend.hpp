@@ -9,44 +9,145 @@
 #ifndef CPUBackend_hpp
 #define CPUBackend_hpp
 
-#include <stdio.h>
 #include <map>
 #include <memory>
+#include <MNN/AutoTime.hpp>
 #include "core/Backend.hpp"
 #include "core/Execution.hpp"
+#include "core/BufferAllocator.hpp"
 #include "MNN_generated.h"
 
-namespace MNN {
-class BufferAllocator;
+#ifdef MNN_USE_THREAD_POOL
+#include "ThreadPool.hpp"
+#endif
 
-class CPUBackend final : public Backend {
+namespace MNN {
+class WorkerThread;
+class CPUResizeCache;
+class CPURuntime : public Runtime {
 public:
-    CPUBackend(int numberThread = 4, BackendConfig::MemoryMode memory = BackendConfig::Memory_Normal,
-               BackendConfig::PowerMode = BackendConfig::Power_Normal, size_t flags = 0);
+    struct DynamicAllocator {
+        std::shared_ptr<BufferAllocator> mDynamicAllocator;
+        std::shared_ptr<BufferAllocator> mDynamicAllocatorBackup;
+        BufferAllocator* mCurrentDynamicAllocator = nullptr;
+        std::vector<std::shared_ptr<CPUResizeCache>> mCacheGroup;
+    };
+    friend class CPUBackend;
+    CPURuntime(const Backend::Info& info);
+    virtual ~ CPURuntime();
+    int onGetRuntimeStatus(RuntimeStatus statusEnum) const override;
+    virtual Backend* onCreate(const BackendConfig* config, Backend* origin) const override;
+    virtual void onReset(int numberThread, const BackendConfig* config, bool full) override;
+    virtual void onGabageCollect(int level) override;
+    virtual float onGetMemoryInMB() override;
+    virtual CompilerType onGetCompilerType() const override {
+        return Compiler_Loop;
+    }
+    virtual void onConcurrencyBegin() const override;
+    virtual void onConcurrencyEnd() const override;
+    virtual bool onCheckInfo(Backend::Info& info) const override;
+
+    SingleBufferWithAllocator* buffer(int index) const {
+        return (mDynamicMmap.empty() ? mDynamic.data() : mDynamicMmap.data()) + index;
+    }
+    BufferAllocator* createDynamicBufferAlloctor(int index) const;
+
+private:
+    void _bindCPUCore() const;
+    void _resetThreadPool() const;
+    void _validateCpuIds() const;
+    mutable std::shared_ptr<EagerBufferAllocator> mStaticAllocator;
+    mutable int mThreadNumber;
+    mutable std::vector<int> mCpuIds;
+    mutable unsigned long mCpuMask;
+#ifdef MNN_USE_THREAD_POOL
+    mutable ThreadPool* mThreadPool = nullptr;
+#endif
+#ifdef MNN_USE_THREAD_POOL
+    mutable int mTaskIndex = -1;
+    mutable int mThreadOpen = 0;
+#endif
+    BackendConfig::MemoryMode mMemory;
+    BackendConfig::PowerMode mPower;
+    BackendConfig::PrecisionMode mPrecision;
+
+    // Backend features
+    // CPU features
+    static Backend*(*gExtraCreate)(const Runtime* runtime);
+    size_t mFlags = 0;
+    mutable int mCurrentTID = 0;
+    mutable std::vector<SingleBufferWithAllocator> mDynamic;
+    mutable std::vector<SingleBufferWithAllocator> mDynamicMmap;
+    mutable std::shared_ptr<DynamicAllocator> mSharedDmaInfo;
+    mutable std::shared_ptr<EagerBufferAllocator> mStaticAllocatorRaw;
+    mutable std::shared_ptr<EagerBufferAllocator> mStaticAllocatorMMap;
+};
+struct CoreFunctions;
+struct CoreInt8Functions;
+struct MatmulRelatedFunctions;
+
+class CPUMemObj : public Backend::MemObj {
+public:
+    CPUMemObj(BufferAllocator* allocator, MemChunk chunk, int size) : mAllocator(allocator), mChunk(chunk), mSize(size) {}
+    virtual ~ CPUMemObj() {
+        if (mAllocator) {
+            mAllocator->free(mChunk);
+        }
+    }
+    virtual MemChunk chunk() {
+        return mChunk;
+    }
+    inline int getSize() const { return mSize; }
+
+private:
+    BufferAllocator* mAllocator;
+    MemChunk mChunk;
+    int mSize;
+};
+class CPUBackend : public Backend {
+public:
+    CPUBackend(const CPURuntime* runtime, BackendConfig::PrecisionMode precision, BackendConfig::MemoryMode memory, MNNForwardType type = MNN_FORWARD_CPU, size_t flags = 0);
     virtual ~CPUBackend();
 
     // Return sizeDivide, scheduleNumber aligned memory
     std::pair<int, int> multiThreadDivide(int size) const;
+    virtual bool onSelectDynamicAllocator(int index, int maxIndex) override;
+    // dividedSize's length should be larger than threadNumber
+    // threads > 0: divide for that many workers instead of mThreadNumber (for callers
+    // whose concurrency is capped by computeThreadNumber)
+    void computeDivideSizes(int size, int* dst, float computeI = 0.f, int threads = 0) const;
+
 public:
-    virtual bool onAcquireBuffer(const Tensor* nativeTensor, StorageType storageType) override;
-    virtual bool onReleaseBuffer(const Tensor* nativeTensor, StorageType storageType) override;
-    virtual bool onAllocateBuffer() override;
+    virtual MemObj* onAcquire(const Tensor* nativeTensor, StorageType storageType) override;
     virtual bool onClearBuffer() override;
     virtual void onCopyBuffer(const Tensor* srcTensor, const Tensor* dstTensor) const override;
-    virtual std::pair<float, bool> onMeasure(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs,
-                                            const MNN::Op* op) override;
 
     virtual Execution* onCreate(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs,
                                 const MNN::Op* op) override;
+
     virtual void onExecuteBegin() const override;
     virtual void onExecuteEnd() const override;
-    
-    virtual void* getAllocator(StorageType type = DYNAMIC) const override{
-        if(type == STATIC){
-            return (void*)mStaticAllocator.get();
-        }
-        return (void*)mDynamicAllocator.get();
+    virtual void* onMapTensor(Tensor::MapType mtype, Tensor::DimensionType dtype, const Tensor* srcTensor) override;
+
+    virtual bool onUnmapTensor(Tensor::MapType mtype, Tensor::DimensionType dtype, const Tensor* dstTensor, void* mapPtr) override;
+
+    virtual void onResizeBegin() override;
+    virtual ErrorCode onResizeEnd() override;
+
+    const CoreFunctions* functions() const {
+        return mCoreFunctions;
     }
+    
+    const MatmulRelatedFunctions* int8GemmFunctions() const {
+        return mRelatedFunctions;
+    }
+    // Return element size for Tensor, conside pack
+    size_t getTensorSize(const Tensor* tensor, bool multiBytes = false) const;
+    const CoreInt8Functions* int8Functions() const {
+        return mInt8CoreFunctions;
+    }
+    void _prepareTensorMemory(const Tensor* srcTensor, const Tensor* dstTensor) const;
+
 public:
     class Creator {
     public:
@@ -56,54 +157,105 @@ public:
 
     static bool addCreator(OpType t, Creator* c);
 
-    int threadNumber() const {
+    inline int threadNumber() const {
         return mThreadNumber;
     }
 
-    BufferAllocator* getBufferAllocator() const {
-        return static_cast<BufferAllocator*>(this->getAllocator());
+    // Thread count for compute-bound work split statically across many
+    // independent items (prefill-shaped). Efficiency-core workers only
+    // straggle such splits at the barrier, so participation is capped at the
+    // performance-cluster size. Single/few-item work (decode) is
+    // bandwidth-bound and keeps every thread.
+    int computeThreadNumber(int workItems) const;
+
+    BufferAllocator* getBufferAllocator(bool defer_allocator = true) const {
+        return mDmaInfo->mCurrentDynamicAllocator;
     }
 
     BackendConfig::MemoryMode memoryMode() const {
         return mMemory;
     }
-    BackendConfig::PowerMode powerMode() const {
-        return mPower;
+    BackendConfig::PrecisionMode precisionMode() const {
+        return mPrecisionMode;
     }
-#ifdef MNN_USE_THREAD_POOL
-    inline int taskIndex() const {return mTaskIndex;}
-#endif
+    CPUResizeCache* getCache() const {
+        return mCache;
+    }
 
-private:
-    std::unique_ptr<BufferAllocator> mStaticAllocator;
-    std::unique_ptr<BufferAllocator> mDynamicAllocator;
-    int mThreadNumber;
+    virtual const Runtime* getRuntime() override;
+
 #ifdef MNN_USE_THREAD_POOL
-    int mTaskIndex;
+    inline int taskIndex() const {return mRuntime->mTaskIndex;}
+    inline ThreadPool* threadPool() const {return mRuntime->mThreadPool;}
+    void enqueue(ThreadPool::TASK& task) const {
+        threadPool()->enqueue(&task, taskIndex());
+    }
 #endif
-    const BackendConfig::MemoryMode mMemory;
-    const BackendConfig::PowerMode mPower;
-    bool mCheckNAN = false;
-    float mFlops = 0.0f;
+    static void initCreatorMap();
+    static size_t getBytes(const Backend* backend, const Tensor* output);
+    static DataType getDataType(const Tensor* tensor);
+    friend class CPURuntime;
+    void enqueueTask(std::function<int()>&& task);
+
+protected:
+    MemObj* allocBuffer(size_t size, Tensor* dest,  StorageType storageType);
+    CoreFunctions* mCoreFunctions;
+    CoreInt8Functions* mInt8CoreFunctions;
+    const MatmulRelatedFunctions* mRelatedFunctions;
+    CPURuntime* mRuntime;
+private:
+    mutable std::shared_ptr<WorkerThread> mInitWorkQueue;
+    mutable int mThreadNumber = 1;
+    std::vector<std::pair<float, int>> mGroupWithComputeRate;
+    float mComputeI = 0.f;
+
+    std::shared_ptr<CPURuntime::DynamicAllocator> mDmaInfo;
+    BackendConfig::PrecisionMode mPrecisionMode;
+    BackendConfig::MemoryMode mMemory;
+    static std::map<OpType, CPUBackend::Creator*>* gCreator;
+    CPUResizeCache* mCache;
+};
+/** execution cast wrapper. insert tensor cast dynamic. */
+class CastWrapExecution : public Execution {
+public:
+    CastWrapExecution(Backend* backend, DataType runT)
+                    : Execution(backend), mRunType(runT) {}
+    virtual ErrorCode onExecute(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs) override;
+private:
+    DataType mRunType;
 };
 
-#ifdef MNN_CODEGEN_REGISTER
+
 #define REGISTER_CPU_OP_CREATOR(name, opType)     \
     void ___##name##__##opType##__() {            \
-        CPUBackend::addCreator(opType, new name); \
+        static name _temp;\
+        CPUBackend::addCreator(opType, &_temp); \
     }
+
+#ifdef MNN_SUPPORT_DEPRECATED_OP
+#define REGISTER_CPU_OP_CREATOR_OLD(name, opType)     \
+    void ___##name##__##opType##__() {            \
+        static name _temp;\
+        CPUBackend::addCreator(opType, &_temp); \
+    }
+
 #else
-
-template <class T>
-class CPUCreatorRegister {
-public:
-    CPUCreatorRegister(OpType type) {
-        CPUBackend::addCreator(type, new T);
+#define REGISTER_CPU_OP_CREATOR_OLD(name, opType)     \
+    void ___##name##__##opType##__() {            \
     }
-};
-
-#define REGISTER_CPU_OP_CREATOR(name, opType) static CPUCreatorRegister<name> _Create##opType(opType)
 #endif
+
+#define REGISTER_CPU_OP_CREATOR_RENDER(name, opType)     \
+    void ___##name##__##opType##__() {            \
+        static name _temp;\
+        CPUBackend::addCreator(opType, &_temp); \
+    }
+
+#define REGISTER_CPU_OP_CREATOR_TRANSFORMER(name, opType)     \
+    void ___##name##__##opType##__() {            \
+        static name _temp;\
+        CPUBackend::addCreator(opType, &_temp); \
+    }
 
 } // namespace MNN
 

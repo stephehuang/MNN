@@ -14,31 +14,23 @@
 #include "core/Backend.hpp"
 #include "core/Execution.hpp"
 #include "core/Macro.h"
+#include "backend/cpu/CPUBackend.hpp"
+#include "backend/cpu/compute/Int8FunctionsOpt.h"
 
 namespace MNN {
 
 /** execution wrapper. hiding cross-backend tensor converting. */
-class MNN_PUBLIC WrapExecution : public Execution {
+class MNN_PUBLIC WrapExecution {
 public:
-    /**
-     * @brief initializer.
-     * @param CPUBackend    CPU backend.
-     * @param execution     execution to be wrapped.
-     */
-    WrapExecution(Backend *CPUBackend, std::shared_ptr<Execution> execution);
-    /**
-     * @brief deinitializer.
-     */
-    virtual ~WrapExecution() = default;
-    virtual ErrorCode onResize(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override;
-    virtual ErrorCode onExecute(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override;
-
-private:
-    Backend *mCPUBackend;
-    std::shared_ptr<Execution> mExecution;
-    std::vector<Tensor *> mWrapInputTensors;
-    std::vector<std::tuple<Backend *, Backend *, Tensor *, std::shared_ptr<Tensor>>> mInputMaps;
+    static void copyReplaceTensor(const Tensor* input, Tensor* output);
+    static bool needWrap(const Tensor* input, Backend* current);
+    static bool allocAndCopy(Backend* curBackend, const Tensor* input, Tensor* output);
+    static Tensor* copyConstCache(Tensor* tensor, Backend* curBackend, std::map<Tensor*, std::shared_ptr<Tensor>>& cache, bool forbidReplace);
+    static std::shared_ptr<Tensor> makeCopyTensor(Tensor* tensor, Backend* targetBackend);
+    static Execution* makeCopyExecution(Backend* backend, Backend* backupBackend);
 };
+
+
 } // namespace MNN
 
 #endif /* WrapExecution_hpp */

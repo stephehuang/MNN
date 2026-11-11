@@ -31,7 +31,9 @@
 #include <MNN/Interpreter.hpp>
 #include <MNN/MNNDefine.h>
 #include <MNN/Tensor.hpp>
+#include <MNN/AutoTime.hpp>
 #include "revertMNNModel.hpp"
+
 /**
  TODOs:
  1. dynamically get CPU related info.
@@ -54,7 +56,7 @@ std::vector<Model> findModelFiles(const char* dir) {
 #if defined(_MSC_VER)
     WIN32_FIND_DATA ffd;
     HANDLE hFind = INVALID_HANDLE_VALUE;
-    std::string mnn_model_pattern = std::string(dir) + "\\*.mnn"; 
+    std::string mnn_model_pattern = std::string(dir) + "\\*.mnn";
     hFind = FindFirstFile(mnn_model_pattern.c_str(), &ffd);
     if (INVALID_HANDLE_VALUE == hFind) {
         std::cout << "open " << dir << " failed: " << strerror(errno) << std::endl;
@@ -94,9 +96,7 @@ std::vector<Model> findModelFiles(const char* dir) {
 
 void setInputData(MNN::Tensor* tensor) {
     float* data = tensor->host<float>();
-    for (int i = 0; i < tensor->elementSize(); i++) {
-        data[i] = Revert::getRandValue();
-    }
+    Revert::fillRandValue(data, tensor->elementSize());
 }
 
 static inline uint64_t getTimeInUs() {
@@ -117,13 +117,20 @@ static inline uint64_t getTimeInUs() {
 }
 
 std::vector<float> doBench(Model& model, int loop, int warmup = 10, int forward = MNN_FORWARD_CPU, bool only_inference = true,
-                           int numberThread = 4, int precision = 2) {
+                           int numberThread = 4, int precision = 2, float sparsity = 0.0f, int sparseBlockOC = 1, bool testQuantModel=false, bool enableKleidiAI=false) {
     auto revertor = std::unique_ptr<Revert>(new Revert(model.model_file.c_str()));
-    revertor->initialize();
+    if (testQuantModel) {
+        revertor->initialize(0, sparseBlockOC, false, true);
+    } else {
+        revertor->initialize(sparsity, sparseBlockOC);
+    }
+
     auto modelBuffer      = revertor->getBuffer();
     const auto bufferSize = revertor->getBufferSize();
-    auto net = std::shared_ptr<MNN::Interpreter>(MNN::Interpreter::createFromBuffer(modelBuffer, bufferSize));
+    auto net = std::shared_ptr<MNN::Interpreter>(MNN::Interpreter::createFromBuffer(modelBuffer, bufferSize), MNN::Interpreter::destroy);
     revertor.reset();
+    net->setSessionMode(MNN::Interpreter::Session_Release);
+    net->setSessionHint(MNN::Interpreter::HintMode::CPU_ENABLE_KLEIDIAI, enableKleidiAI);
     MNN::ScheduleConfig config;
     config.numThread = numberThread;
     config.type      = static_cast<MNNForwardType>(forward);
@@ -134,13 +141,15 @@ std::vector<float> doBench(Model& model, int loop, int warmup = 10, int forward 
 
     std::vector<float> costs;
     MNN::Session* session = net->createSession(config);
-    net->releaseModel();
+
     MNN::Tensor* input    = net->getSessionInput(session, NULL);
 
     // if the model has not the input dimension, umcomment the below code to set the input dims
     // std::vector<int> dims{1, 3, 224, 224};
     // net->resizeTensor(input, dims);
     // net->resizeSession(session);
+
+    net->releaseModel();
 
     const MNN::Backend* inBackend = net->getBackend(session, input);
 
@@ -150,25 +159,29 @@ std::vector<float> doBench(Model& model, int loop, int warmup = 10, int forward 
     std::shared_ptr<MNN::Tensor> expectTensor(MNN::Tensor::createHostTensorFromDevice(outputTensor, false));
     // Warming up...
     for (int i = 0; i < warmup; ++i) {
-        input->copyFromHostTensor(givenTensor.get());
+        void* host = input->map(MNN::Tensor::MAP_TENSOR_WRITE,  input->getDimensionType());
+        input->unmap(MNN::Tensor::MAP_TENSOR_WRITE,  input->getDimensionType(), host);
+
         net->runSession(session);
-        outputTensor->copyToHostTensor(expectTensor.get());
+
+        host = outputTensor->map(MNN::Tensor::MAP_TENSOR_READ,  outputTensor->getDimensionType());
+        outputTensor->unmap(MNN::Tensor::MAP_TENSOR_READ,  outputTensor->getDimensionType(), host);
     }
 
     for (int round = 0; round < loop; round++) {
-        auto timeBegin = getTimeInUs();
-
-        input->copyFromHostTensor(givenTensor.get());
+        MNN::Timer _t;
+        void* host = input->map(MNN::Tensor::MAP_TENSOR_WRITE,  input->getDimensionType());
+        input->unmap(MNN::Tensor::MAP_TENSOR_WRITE,  input->getDimensionType(), host);
         net->runSession(session);
-        outputTensor->copyToHostTensor(expectTensor.get());
-
-        auto timeEnd = getTimeInUs();
-        costs.push_back((timeEnd - timeBegin) / 1000.0);
+        host = outputTensor->map(MNN::Tensor::MAP_TENSOR_READ,  outputTensor->getDimensionType());
+        outputTensor->unmap(MNN::Tensor::MAP_TENSOR_READ,  outputTensor->getDimensionType(), host);
+        auto time = (float)_t.durationInUs() / 1000.0f;
+        costs.push_back(time);
     }
     return costs;
 }
 
-void displayStats(const std::string& name, const std::vector<float>& costs) {
+void displayStats(const std::string& name, const std::vector<float>& costs, int quant = 0) {
     float max = 0, min = FLT_MAX, sum = 0, avg;
     for (auto v : costs) {
         max = fmax(max, v);
@@ -177,7 +190,11 @@ void displayStats(const std::string& name, const std::vector<float>& costs) {
         //printf("[ - ] cost：%f ms\n", v);
     }
     avg = costs.size() > 0 ? sum / costs.size() : 0;
-    printf("[ - ] %-24s    max = %8.3fms  min = %8.3fms  avg = %8.3fms\n", name.c_str(), max, avg == 0 ? 0 : min, avg);
+    std::string model = name;
+    if (quant == 1) {
+        model = "quant-" + name;
+    }
+    printf("[ - ] %-24s    max = %8.3f ms  min = %8.3f ms  avg = %8.3f ms\n", model.c_str(), max, avg == 0 ? 0 : min, avg);
 }
 static inline std::string forwardType(MNNForwardType type) {
     switch (type) {
@@ -317,7 +334,7 @@ void set_cpu_affinity()
     int cpu_id = 0;
     cpu_set_t mask;
     CPU_ZERO(&mask);
-    
+
     auto numberOfCPUs = getNumberOfCPU();
     static std::vector<int> sortedCPUIDs;
     static int littleClusterOffset = 0;
@@ -347,15 +364,38 @@ void set_cpu_affinity()
 #endif
 }
 
+#if TARGET_OS_IPHONE
+void iosBenchAll(const char* modelPath) {
+    std::cout << "MNN benchmark" << std::endl;
+    int loop               = 20;
+    int warmup             = 10;
+    MNNForwardType forward = MNN_FORWARD_CPU;
+    forward = MNN_FORWARD_NN;
+    int numberThread       = 4;
+    int precision = 2;
+    std::cout << "Forward type: **" << forwardType(forward) << "** thread=" << numberThread << "** precision=" <<precision << std::endl;
+    std::vector<Model> models = findModelFiles(modelPath);
+    std::cout << "--------> Benchmarking... loop = " << loop << ", warmup = " << warmup << std::endl;
 
+    for (auto& m : models) {
+        std::vector<float> costs = doBench(m, loop, warmup, forward, false, numberThread, precision);
+        displayStats(m.name, costs);
+    }
+}
+#else
 int main(int argc, const char* argv[]) {
     std::cout << "MNN benchmark" << std::endl;
     int loop               = 10;
     int warmup             = 10;
     MNNForwardType forward = MNN_FORWARD_CPU;
+    int testQuantizedModel = 0;
     int numberThread       = 4;
+    int precision = 2;
+    float sparsity = 0.0f;
+    int sparseBlockOC = 1;
+    bool enableKleidiAI = false;
     if (argc <= 2) {
-        std::cout << "Usage: " << argv[0] << " models_folder [loop_count] [warmup] [forwardtype] [numberThread] [precision]" << std::endl;
+        std::cout << "Usage: " << argv[0] << " models_folder [loop_count] [warmup] [forwardtype] [numberThread] [precision] [weightSparsity] [testQuantizedModel] [enableKleidiAI]" << std::endl;
         return 1;
     }
     if (argc >= 3) {
@@ -370,20 +410,48 @@ int main(int argc, const char* argv[]) {
     if (argc >= 6) {
         numberThread = atoi(argv[5]);
     }
-    int precision = 2;
     if (argc >= 7) {
         precision = atoi(argv[6]);
     }
-    std::cout << "Forward type: **" << forwardType(forward) << "** thread=" << numberThread << "** precision=" <<precision << std::endl;
+    if (argc >= 8) {
+        sparsity = atof(argv[7]);
+    }
+    if(argc >= 9) {
+        sparseBlockOC = atoi(argv[8]);
+    }
+    if(argc >= 10) {
+        testQuantizedModel = atoi(argv[9]);
+    }
+    if (argc >= 11) {
+        enableKleidiAI = atoi(argv[10]) > 0 ? true : false;
+    }
+
+    std::cout << "Forward type: " << forwardType(forward) << " thread=" << numberThread << " precision=" <<precision << " sparsity=" <<sparsity << " sparseBlockOC=" << sparseBlockOC << " testQuantizedModel=" << testQuantizedModel << " enableKleidiAI=" << enableKleidiAI << std::endl;
     std::vector<Model> models = findModelFiles(argv[1]);
 
     std::cout << "--------> Benchmarking... loop = " << argv[2] << ", warmup = " << warmup << std::endl;
-    
+    std::string fpInfType = "precision!=2, use fp32 inference.";
+    if (precision == 2) {
+        fpInfType = "precision=2, use fp16 inference if your device supports and open MNN_ARM82=ON.";
+    }
+    MNN_PRINT("[-INFO-]: %s\n", fpInfType.c_str());
+    if (testQuantizedModel) {
+        MNN_PRINT("[-INFO-]: Auto set sparsity=0 when test quantized model in benchmark...\n");
+    }
+
     /* not called yet */
     // set_cpu_affinity();
-    
+    if (testQuantizedModel) {
+        printf("Auto set sparsity=0 when test quantized model in benchmark...\n");
+    }
+
     for (auto& m : models) {
-        std::vector<float> costs = doBench(m, loop, warmup, forward, false, numberThread, precision);
-        displayStats(m.name, costs);
+        std::vector<float> costs = doBench(m, loop, warmup, forward, false, numberThread, precision, sparsity, sparseBlockOC, false, enableKleidiAI);
+        displayStats(m.name.c_str(), costs, false);
+        if (testQuantizedModel) {
+            costs = doBench(m, loop, warmup, forward, false, numberThread, precision, sparsity, sparseBlockOC, true, enableKleidiAI);
+            displayStats(m.name, costs, 1);
+        }
     }
 }
+#endif

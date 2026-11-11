@@ -14,45 +14,63 @@
 #if MNN_METAL_ENABLED
 namespace MNN {
 
-MetalPReLU::MetalPReLU(Backend *backend, const float *slope, int count) : Execution(backend) {
+MetalPReLU::MetalPReLU(Backend *backend, const float *slope, int count) : MetalExecution(backend) {
     auto context  = (__bridge MNNMetalContext *)static_cast<MetalBackend *>(backend)->context();
-    mSlope        = [context newDeviceBuffer:UP_DIV(count, 4) * 4 * sizeof(float) bytes:slope access:CPUWriteOnly];
+    auto mtbn = static_cast<MetalBackend*>(backend);
+    auto bufferAlloc = mtbn->getStaticBufferPool();
+    mSlope = bufferAlloc->alloc(UP_DIV(count, 4) * 4 * sizeof(float));
+    if (nullptr == mSlope.first) {
+        mValid = false;
+        return;
+    }
+    auto buffer = ((MetalRuntimeAllocator::MetalBufferAlloc*)mSlope.first)->getBuffer();
+    auto ptr = MetalBackend::getMemPtr(mSlope);
+    ::memset(ptr, 0, UP_DIV(count, 4) * 4 * sizeof(float));
+    ::memcpy(ptr, slope, count * sizeof(float));
     mShareChannel = 1 == count;
+    if (!mShareChannel) {
+        mShape = [context newDeviceBuffer:3 * sizeof(int) access:CPUWriteOnly];
+    }
+    mPipeline = [context pipelineWithName:mShareChannel ? @"prelu" : @"prelu_slopes" fp16:mtbn->useFp16InsteadFp32()];
 }
-
-ErrorCode MetalPReLU::onExecute(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) {
+MetalPReLU::~MetalPReLU() {
+    if (nullptr != mSlope.first) {
+        auto mtbn = static_cast<MetalBackend*>(backend());
+        auto bufferAlloc = mtbn->getStaticBufferPool();
+        bufferAlloc->free(mSlope);
+    }
+}
+ErrorCode MetalPReLU::onResize(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) {
     auto backend = static_cast<MetalBackend *>(this->backend());
     auto context = (__bridge MNNMetalContext *)backend->context();
-    auto input = inputs[0], output = outputs[0];
+    auto output = outputs[0];
     int w = output->width(), h = output->height(), z = UP_DIV(output->channel(), 4), b = output->batch();
-
-    auto encoder   = [context encoder];
-    auto bandwidth = [context load:mShareChannel ? @"prelu" : @"prelu_slopes" encoder:encoder];
-    [encoder setBuffer:(__bridge id<MTLBuffer>)(void *)input->deviceId() offset:0 atIndex:0];
-    [encoder setBuffer:(__bridge id<MTLBuffer>)(void *)output->deviceId() offset:0 atIndex:1];
-    [encoder setBuffer:mSlope offset:0 atIndex:2];
     if (mShareChannel) {
-        [context dispatchEncoder:encoder
-                         threads:{ (NSUInteger) w * h * z * b, (NSUInteger)1, (NSUInteger)1 }
-                       bandwidth:bandwidth];
+        mThreads = [context computeBestGroupAndLocal:mPipeline threads:MTLSizeMake(w * h * z * b, 1, 1)];
     } else {
-        auto shape                 = [context newDeviceBuffer:3 * sizeof(int) access:CPUWriteOnly];
-        ((int *)shape.contents)[0] = w * h;
-        ((int *)shape.contents)[1] = z;
-        ((int *)shape.contents)[2] = b;
-        [encoder setBuffer:shape offset:0 atIndex:3];
-        [context dispatchEncoder:encoder
-                         threads:{ (NSUInteger) w * h, (NSUInteger)z, (NSUInteger)b }
-                       bandwidth:bandwidth];
+        ((int *)mShape.contents)[0] = w * h;
+        ((int *)mShape.contents)[1] = z;
+        ((int *)mShape.contents)[2] = b;
+        mThreads = [context computeBestGroupAndLocal:mPipeline threads:MTLSizeMake(w * h, z, b)];
     }
-    [encoder endEncoding];
-    MNN_PRINT_ENCODER(context, encoder);
     return NO_ERROR;
+}
+
+void MetalPReLU::onEncode(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs, id<MTLComputeCommandEncoder> encoder) {
+    auto input = inputs[0], output = outputs[0];
+    [encoder setComputePipelineState:mPipeline];
+    MetalBackend::setTensor(input, encoder, 0);
+    MetalBackend::setTensor(output, encoder, 1);
+    MetalBackend::setMem(mSlope, encoder, 2);
+    if (!mShareChannel) {
+        [encoder setBuffer:mShape offset:0 atIndex:3];
+    }
+    [encoder dispatchThreadgroups:mThreads.first threadsPerThreadgroup:mThreads.second];
 }
 
 class MetalPReLUCreator : public MetalBackend::Creator {
 public:
-    virtual Execution *onCreate(const std::vector<Tensor *> &inputs, const MNN::Op *op, Backend *backend) const {
+    virtual Execution *onCreate(const std::vector<Tensor *> &inputs, const MNN::Op *op, Backend *backend, const std::vector<Tensor *>& outputs) const {
         auto prelu = op->main_as_PRelu();
         return new MetalPReLU(backend, prelu->slope()->data(), prelu->slopeCount());
     }

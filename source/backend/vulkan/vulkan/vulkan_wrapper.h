@@ -20,19 +20,14 @@
 #endif
 #include "core/Macro.h"
 #include "vulkan/vulkan.h"
+#include <MNN/MNNDefine.h>
 // Vulkan call wrapper
-#define CALL_VK(func)                                                                       \
-    {                                                                                       \
-        auto res = (func);                                                                  \
-        if (VK_SUCCESS != res) {                                                            \
-            MNN_ERROR("Vulkan error: %d. File[%s], line[%d]\n", res, __FILE__, __LINE__); \
-        }                                                                                   \
-    }
+#define CALL_VK(func) \
+{ \
+auto restemp = (func); MNN_ASSERT(restemp == VK_SUCCESS); \
+}
 
-#define MNN_VK_CHECK(res)                                              \
-    if (VK_SUCCESS != res) {                                             \
-        MNN_ERROR("%s, %d, errorcode: %d\n", __func__, __LINE__, res); \
-    }
+#define MNN_VK_CHECK(res) if(res != VK_SUCCESS) MNN_PRINT("Error code : %d\n", res);
 
 /* Initialize the Vulkan function pointer variables declared in this header.
  * Returns 0 if vulkan is not available, non-zero if it is available.
@@ -44,9 +39,12 @@ extern PFN_vkCreateInstance vkCreateInstance;
 extern PFN_vkDestroyInstance vkDestroyInstance;
 extern PFN_vkEnumeratePhysicalDevices vkEnumeratePhysicalDevices;
 extern PFN_vkGetPhysicalDeviceFeatures vkGetPhysicalDeviceFeatures;
+extern PFN_vkGetPhysicalDeviceFeatures2 vkGetPhysicalDeviceFeatures2;
+extern PFN_vkGetPhysicalDeviceFeatures2 vkGetPhysicalDeviceFeatures2KHR;
 extern PFN_vkGetPhysicalDeviceFormatProperties vkGetPhysicalDeviceFormatProperties;
 extern PFN_vkGetPhysicalDeviceImageFormatProperties vkGetPhysicalDeviceImageFormatProperties;
 extern PFN_vkGetPhysicalDeviceProperties vkGetPhysicalDeviceProperties;
+extern PFN_vkGetPhysicalDeviceProperties2 vkGetPhysicalDeviceProperties2;
 extern PFN_vkGetPhysicalDeviceQueueFamilyProperties vkGetPhysicalDeviceQueueFamilyProperties;
 extern PFN_vkGetPhysicalDeviceMemoryProperties vkGetPhysicalDeviceMemoryProperties;
 extern PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr;

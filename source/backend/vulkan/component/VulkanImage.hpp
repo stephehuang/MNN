@@ -21,65 +21,78 @@ public:
     VkSampler get() const {
         return mSampler;
     }
-
 private:
     VkSampler mSampler;
     const VulkanDevice& mDevice;
 };
 
-class VulkanImage : public NonCopyable {
+class VulkanImage : public RefCount {
 public:
-    VulkanImage(const VulkanMemoryPool& pool, bool seperate, const std::vector<int>& dims,
-                halide_type_t type = halide_type_of<float>());
-    VulkanImage(const VulkanMemoryPool& pool, bool seperate, int w, int h)
-        : VulkanImage(pool, seperate, std::vector<int>{w, h}) {
+    VulkanImage(const VulkanMemoryPool& pool, bool separate, const std::vector<int>& dims,
+                VkFormat format = VK_FORMAT_R32G32B32A32_SFLOAT, VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT);
+    VulkanImage(const VulkanMemoryPool& pool, bool separate, int w, int h)
+        : VulkanImage(pool, separate, std::vector<int>{w, h}) {
     }
     virtual ~VulkanImage();
+    void barrierWrite(VkCommandBuffer buffer) const;
+    void barrierRead(VkCommandBuffer buffer) const;
 
     inline int width() const {
-        return mWidth;
+        return std::get<1>(mInfo);
     }
     inline int height() const {
-        return mHeight;
+        return std::get<2>(mInfo);
     }
     inline int depth() const {
-        return mDepth;
+        return std::get<3>(mInfo);
     }
     inline std::vector<int> dims() const {
         return mDims;
     }
     inline VkImage get() const {
-        return mImage;
+        return mImage.first;
     }
     inline VkImageView view() const {
-        return mImageView;
+        return mImage.second;
     }
     inline VkFormat format() const {
-        return mFormat;
+        return std::get<4>(mInfo);
     }
-    inline VkImageLayout layout() const {
+    void release();
+    bool valid() const {
+        return mMemory.first != nullptr;
+    }
+    void resetBarrier() {
+        mLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    }
+    VkImageLayout currentLayout() const {
         return mLayout;
     }
-    inline void setLayout(VkImageLayout layout) {
-        mLayout = layout;
+    const VulkanDevice& device() const {
+        return mDevice;
     }
 
-    void release();
+    static void insertMemoryBarrier(
+                                  VkCommandBuffer cmdbuffer,
+                                  VkImage image,
+                                  VkAccessFlags srcAccessMask,
+                                  VkAccessFlags dstAccessMask,
+                                  VkImageLayout oldImageLayout,
+                                  VkImageLayout newImageLayout,
+                                  VkPipelineStageFlags srcStageMask,
+                                  VkPipelineStageFlags dstStageMask,
+                                  VkImageSubresourceRange subresourceRange
+                                  );
 
 private:
-    VkImage mImage;
-    VkImageView mImageView;
-    VkFormat mFormat;
-    VkImageLayout mLayout;
+    std::tuple<VkImageType, uint32_t, uint32_t, uint32_t, VkFormat> mInfo;
+    std::pair<VkImage, VkImageView> mImage;
     const VulkanDevice& mDevice;
-    int mWidth;
-    int mHeight;
-    int mDepth;
-
     std::vector<int> mDims;
     const VulkanMemoryPool& mPool;
-    const VulkanMemory* mMemory;
-    bool mReleased = false;
+    MemChunk mMemory;
+    mutable VkImageLayout mLayout;
+    mutable VkAccessFlagBits mAccess;
 };
 } // namespace MNN
 

@@ -10,54 +10,54 @@
 #define MetalConvolutionCommon_hpp
 
 #import "core/ConvolutionCommon.hpp"
-#import "core/Execution.hpp"
+#import "MetalBackend.hpp"
+#import "MetalExecution.hpp"
 #import "MNNMetalContext.h"
-#import "MNN_generated.h"
-#import "MetalDefine.h"
-
 #if MNN_METAL_ENABLED
 namespace MNN {
 
-class MetalConvolutionCommon : public Execution {
+class MetalConvolutionCommon : public MetalExecution {
 public:
-    MetalConvolutionCommon(Backend *backend, const MNN::Op *op);
+    MetalConvolutionCommon(Backend *backend, const MNN::Op *op, std::shared_ptr<MNN::Tensor> bias);
     virtual ~MetalConvolutionCommon() = default;
-    virtual ErrorCode onResize(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override;
-    virtual ErrorCode onExecute(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override;
 
 protected:
-    void loadWeight(const MNN::Convolution2D *conv);
+    void loadWeight(const MNN::Op *op, bool loadWeightInt8 = false);
 
-    virtual ErrorCode onQuantized(const Tensor *input, const Tensor *output) = 0;
-    virtual ErrorCode onFloat(const Tensor *input, const Tensor *output)     = 0;
-    virtual id<MTLBuffer> weightForQuantized(int group, int oc, int ic, int kh, int kw, const int8_t *src);
-    virtual id<MTLBuffer> weightForFloat(int group, int oc, int ic, int kh, int kw, const float *src);
-
+    virtual std::shared_ptr<MNN::Tensor> weightTransform(int group, int oc, int ic, int kh, int kw, const float *src, bool int8Weight = false, bool int4Weight = false, id<MTLBuffer> srcGpuBuffer = nil, int subBits = 0);
 private:
-    id<MTLBuffer> weightForConv(const Convolution2D *, ConvolutionCommon::Int8Common *, bool);
-
+    template <typename FType, typename TType>
+    void convertWeightFormat(int group, int oc, int ic, int kh, int kw, const FType *src, TType* dstOrigion, Tensor* dstTensor, id<MTLBuffer> srcGpuBuffer);
 protected:
-    bool mDepthwise     = false;
-    int mGroups         = 0;
+    struct Param {
+        int inputSize;
+        int inputDepthQuad;
+        int outputWidth;
+        int outputHeight;
+        int outputSize;
+        int outputDepthQuad;
+        int outputChannel;
+        int batch;
+        int blockCount;
+        int activation;
+        float scaleCoef;
+    };
+    
+protected:
     int mKernelX        = 0;
     int mKernelY        = 0;
-    PadMode mPadMode    = PadMode_CAFFE;
-    int mPadX           = 0;
-    int mPadY           = 0;
     int mStrideX        = 0;
     int mStrideY        = 0;
     int mDilateX        = 0;
     int mDilateY        = 0;
     int mActivationType = 0;
+    const MNN::Op *mOp  = nullptr;
 
-    bool mQnt            = false;
-    int32_t mQntRange[2] = {0, 0};
-    float mQntScale      = 0;
-    std::shared_ptr<Tensor> mQntInput;
-
-    id<MTLBuffer> mWeight      = nil;
-    id<MTLBuffer> mBias        = nil;
-    id<MTLBuffer> mAlpha       = nil;
+    std::shared_ptr<MNN::Tensor> mWeight;
+    std::shared_ptr<MNN::Tensor> mBias;
+    std::shared_ptr<MNN::Tensor> mDequantScaleBias;
+    int mDequantBits;
+    float mScaleCoef;
     id<MTLBuffer> mConstBuffer = nil;
 };
 

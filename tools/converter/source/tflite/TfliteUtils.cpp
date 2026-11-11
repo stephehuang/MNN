@@ -11,7 +11,6 @@
 #include <memory>
 
 #include "TfliteUtils.hpp"
-#include "logkit.h"
 
 void CalculateActivationRangeQuantizedImpl(const MNN::FusedActivation activation, const int32_t qmin,
                                            const int32_t qmax, const tfliteQuanParam& outputQuan, int32_t* act_min,
@@ -93,26 +92,49 @@ void QuantizeMultiplier(double double_multiplier, int32_t* quantized_multiplier,
     *quantized_multiplier = static_cast<int32_t>(q_fixed);
 }
 
-bool convertDataFormatTflite(const float* src, float* dst, int KH, int KW, int CI, int CO) {
-    DCHECK(KH > 0);
-    DCHECK(KW > 0);
-    DCHECK(CI > 0);
-    DCHECK(CO > 0);
-    DCHECK(src != nullptr);
-    // CO KH KW CI --> CO CI KH KW
+bool convertDataFormatTflite(const float* src, float* dst, int KH, int KW, int CI, int CO, bool deconv) {
+    if (KH <= 0 || KW <= 0 || CI <= 0 || CO <= 0) {
+        DLOG(ERROR) << "convertDataFormatTflite got non-positive dims: " << KH << "x" << KW << "x" << CI << "x" << CO;
+        return false;
+    }
+    if (nullptr == src || nullptr == dst) {
+        DLOG(ERROR) << "convertDataFormatTflite got null src/dst";
+        return false;
+    }
+    // deconv: CI KH KW CO --> CO CI KH KW
+    // conv  : CO KH KW CI --> CO CI KH KW
     for (int oc = 0; oc < CO; ++oc) {
         for (int ic = 0; ic < CI; ++ic) {
             for (int h = 0; h < KH; ++h) {
                 for (int w = 0; w < KW; ++w) {
-                    dst[(oc * CI + ic) * KH * KW + h * KW + w] = src[(oc * KH + h) * KW * CI + w * CI + ic];
+                    dst[(oc * CI + ic) * KH * KW + h * KW + w] = deconv ? src[(ic * KH + h) * KW * CO + w * CO + oc] : src[(oc * KH + h) * KW * CI + w * CI + ic];
                 }
             }
         }
     }
-
     return true;
 }
 
+bool computeTfliteWeightSize(const int32_t* dims, int dimCount, int* weightSize) {
+    if (nullptr == dims || nullptr == weightSize || dimCount <= 0) {
+        return false;
+    }
+    // Callers store the result in an int, so anything larger is not a size this converter can support.
+    // Compare the running product against INT_MAX / dim before multiplying: multiplying first would
+    // overflow int64 for malformed dimensions, and the overflowed value would then pass the check.
+    const int64_t kMaxSize = std::numeric_limits<int>::max();
+    int64_t product = 1;
+    for (int i = 0; i < dimCount; ++i) {
+        const int64_t dim = dims[i];
+        // dim <= 0 is tested first so that the division below is never a division by zero.
+        if (dim <= 0 || product > kMaxSize / dim) {
+            return false;
+        }
+        product *= dim;
+    }
+    *weightSize = static_cast<int>(product);
+    return true;
+}
 
 MNN::DataType TfliteDataTypeToMNN(tflite::TensorType type) {
     if (type == tflite::TensorType_FLOAT32) {
@@ -126,6 +148,22 @@ MNN::DataType TfliteDataTypeToMNN(tflite::TensorType type) {
     }
     if (type == tflite::TensorType_INT32) {
         return MNN::DataType_DT_INT32;
+    }
+    return MNN::DataType_DT_INVALID;
+}
+
+MNN::DataType TfliteDequantDataTypeToMNN(tflite::TensorType type) {
+    if (type == tflite::TensorType_FLOAT32) {
+        return MNN::DataType_DT_FLOAT;
+    }
+    if (type == tflite::TensorType_INT8) {
+        return MNN::DataType_DT_QINT8;
+    }
+    if (type == tflite::TensorType_UINT8) {
+        return MNN::DataType_DT_QUINT8;
+    }
+    if (type == tflite::TensorType_INT32) {
+        return MNN::DataType_DT_QINT32;
     }
     return MNN::DataType_DT_INVALID;
 }

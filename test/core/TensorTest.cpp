@@ -6,15 +6,15 @@
 //  Copyright © 2018, Alibaba Group Holding Limited
 //
 
-#include "MNNTestSuite.h"
 #include <MNN/Tensor.hpp>
+#include "MNNTestSuite.h"
 
 using namespace MNN;
 
 class TensorTest : public MNNTestCase {
 public:
     virtual ~TensorTest() = default;
-    virtual bool run() {
+    virtual bool run(int precision) {
         // initializer
         {
             Tensor caffe(3, Tensor::CAFFE);
@@ -44,10 +44,10 @@ public:
             MNNTEST_ASSERT(alloc.deviceId() == 0);
 
             MNNTEST_ASSERT(alloc.length(0) == 3);
-            MNNTEST_ASSERT(alloc.length(1) == 5);
-            MNNTEST_ASSERT(alloc.length(2) == 7);
+            MNNTEST_ASSERT(alloc.length(1) == 7);
+            MNNTEST_ASSERT(alloc.length(2) == 5);
             MNNTEST_ASSERT(alloc.stride(0) == 5 * 7);
-            MNNTEST_ASSERT(alloc.stride(1) == 7);
+            MNNTEST_ASSERT(alloc.stride(1) == 5);
             MNNTEST_ASSERT(alloc.stride(2) == 1);
         }
         {

@@ -9,8 +9,9 @@
 #include "BinaryGrad.hpp"
 #include "core/Macro.h"
 using namespace std;
-using namespace MNN;
 using namespace MNN::Express;
+namespace MNN {
+
 class EltwiseGrad : public OpGrad {
 public:
     virtual std::vector<Express::VARP> onGrad(Express::EXPRP expr,
@@ -55,7 +56,7 @@ public:
             }
             case MNN::EltwiseType_MAXIMUM: {
                 for (int i = 0; i < inputs.size(); ++i) {
-                    auto mask = _Sign(inputs[i] - Variable::create(expr, i)) + _Const(1.0f, {}, NCHW);
+                    auto mask = _Sign(inputs[i] - Variable::create(expr, 0)) + _Const(1.0f, {}, NCHW);
                     res[i]    = mask * outputDiff;
                 }
                 break;
@@ -79,6 +80,11 @@ public:
         for (int i = 0; i < expr->outputSize(); ++i) {
             output[i] = Variable::create(expr, i);
         }
+        int activateType = op->main_as_BinaryOp()->activationType();
+        if (activateType == 1) { // relu
+            auto mask = _Cast<float>(_Greater(output[0], _Scalar(0.0f)));
+            outputDiff = mask * backwardOutput[0];
+        }
         switch (op->main_as_BinaryOp()->opType()) {
             case BinaryOpOperation_ADD: {
                 res[0] = outputDiff;
@@ -98,15 +104,17 @@ public:
             case BinaryOpOperation_MAXIMUM: {
                 auto mask0 = _Sign(inputs[0] - output[0]) + _Const(1.0f, {}, NCHW);
                 auto mask1 = _Sign(inputs[1] - output[0]) + _Const(1.0f, {}, NCHW);
-                res[0]     = outputDiff * mask0;
-                res[1]     = outputDiff * mask1;
+                auto maskSum = mask0 + mask1;
+                res[0]     = outputDiff * mask0 / maskSum;
+                res[1]     = outputDiff * mask1 / maskSum;
                 break;
             }
             case BinaryOpOperation_MINIMUM: {
                 auto mask0 = _Sign(output[0] - inputs[0]) + _Const(1.0f, {}, NCHW);
                 auto mask1 = _Sign(output[0] - inputs[1]) + _Const(1.0f, {}, NCHW);
-                res[0]     = outputDiff * mask0;
-                res[1]     = outputDiff * mask1;
+                auto maskSum = mask0 + mask1;
+                res[0]     = outputDiff * mask0 / maskSum;
+                res[1]     = outputDiff * mask1 / maskSum;
                 break;
             }
             case BinaryOpOperation_REALDIV: {
@@ -115,7 +123,29 @@ public:
                 res[1] = _Negative(_Multiply(outputDiff, _Divide(output[0], inputs[1])));
                 break;
             }
+            case BinaryOpOperation_POW: {
+                // d (pow(x, y)) = dv * pow(x, y) / x * y , dv * pow(x, y) * ln(x)
+                res[0] = outputDiff * output[0] * OpGrad::divideAvoidZero(inputs[1], inputs[0]);
+                res[1] = outputDiff * output[0] * _Log(inputs[0]);
+                break;
+            }
+            case BinaryOpOperation_ATAN2: {
+                // d atan(x/y) = (y/(x^2 + y^2), -x/(x^2 + y^2)) * outputDiff
+                auto x2y2 = _Square(inputs[0]) + _Square(inputs[1]);
+                res[0] = inputs[1] / x2y2 * outputDiff;
+                res[1] = _Negative(inputs[0]) / x2y2 * outputDiff;
+                break;
+            }
+            case BinaryOpOperation_SquaredDifference: {
+                // d (x - y)^2 = (2 * (x - y), -2 * (x - y)) * outputDiff
+                auto two = _Scalar(2.0f);
+                auto xmy = inputs[0] - inputs[1];
+                res[0] = two * xmy * outputDiff;
+                res[1] = _Negative(res[0]);
+                break;
+            }
             default:
+                MNN_ERROR("Can't grad for binary: %d\n", op->main_as_BinaryOp()->opType());
                 return res;
         }
         for (int i = 0; i < inputs.size(); ++i) {
@@ -164,10 +194,11 @@ public:
     }
 };
 
-static const auto gRegister = []() {
+static void _create() {
     static BinaryGrad _c;
     OpGrad::insert((int)OpType_BinaryOp, &_c);
     static EltwiseGrad _d;
     OpGrad::insert((int)OpType_Eltwise, &_d);
-    return true;
-}();
+}
+REGISTER_GRAD(BinaryGrad, _create);
+};

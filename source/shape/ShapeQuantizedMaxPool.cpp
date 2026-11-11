@@ -5,10 +5,10 @@
 //  Created by MNN on 2019/01/10.
 //  Copyright © 2018, Alibaba Group Holding Limited
 //
-#ifdef MNN_SUPPORT_TFLITE_QUAN
+#include "shape/SizeComputer.hpp"
+#ifdef MNN_SUPPORT_DEPRECATED_OP
 #include <math.h>
 #include "core/Macro.h"
-#include "core/SizeComputer.hpp"
 
 namespace MNN {
 class QuantizedMaxPoolComputer : public SizeComputer {
@@ -40,7 +40,7 @@ class QuantizedMaxPoolComputer : public SizeComputer {
             return false;
         }
 
-        // output：NHWC MNN: nchw
+        // max pool use nhwc
         auto& outputBuffer         = outputs[0]->buffer();
         outputBuffer.dimensions    = input->buffer().dimensions;
         outputBuffer.dim[0].extent = input->buffer().dim[0].extent;
@@ -55,6 +55,9 @@ class QuantizedMaxPoolComputer : public SizeComputer {
     }
 };
 
-REGISTER_SHAPE(QuantizedMaxPoolComputer, OpType_QuantizedMaxPool);
 } // namespace MNN
 #endif
+
+namespace MNN {
+REGISTER_SHAPE_OLD(QuantizedMaxPoolComputer, OpType_QuantizedMaxPool);
+};

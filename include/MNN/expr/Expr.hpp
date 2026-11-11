@@ -6,11 +6,10 @@
 //  Copyright © 2018, Alibaba Group Holding Limited
 //
 
-#ifndef Expr_hpp
-#define Expr_hpp
+#ifndef MNN_Expr_hpp
+#define MNN_Expr_hpp
 
 #include <functional>
-#include <list>
 #include <string>
 #include <vector>
 #include <map>
@@ -19,9 +18,11 @@
 #include <MNN/MNNDefine.h>
 
 namespace MNN {
+struct BufferStorage;
 struct OpT;
 struct Op;
 struct NetT;
+class Tensor;
 namespace Express {
 class Variable;
 class Expr;
@@ -86,7 +87,11 @@ public:
         TRAINABLE = 2,
     };
     bool fix(InputType type) const;
+
+    // Only valid for Input / Const / Trainable
+    void setOrder(Dimensionformat format);
 private:
+    friend class Variable;
     std::shared_ptr<Variable> mContent;
 };
 inline bool operator==(Variable* src, VARP dst) {
@@ -106,12 +111,14 @@ public:
         Dimensionformat order = NHWC;
         INTS dim;
         halide_type_t type;
-        int size;
-        void* ptr = nullptr;
+        size_t size;
         void syncSize();
     };
     const std::string& name() const;
     void setName(const std::string& name);
+    bool setDevicePtr(const void* devicePtr, int memoryType);
+    bool copyToDevicePtr(void* devicePtr, int memoryType);
+
     std::pair<EXPRP, int> expr() const {
         return std::make_pair(mFrom, mFromIndex);
     }
@@ -126,6 +133,10 @@ public:
     template <typename T>
     T* writeMap() {
         return (T*)writeInternal();
+    }
+
+    void writeScaleMap(float scaleValue, float zeroPoint) {
+        writeScaleInternal(scaleValue, zeroPoint);
     }
 
     //Depecerate
@@ -144,10 +155,12 @@ public:
     static std::vector<VARP> mapToSequence(const std::map<std::string, VARP>& source);
     static std::vector<EXPRP> getExecuteOrder(const std::vector<VARP>& output);
     static void save(const std::vector<VARP>& vars, const char* fileName);
+    static std::vector<int8_t> save(const std::vector<VARP>& vars);
     static void save(const std::vector<VARP>& vars, NetT* dest);
-    
+
     // Pack a few Variable to compute in one pipeline
     static void prepareCompute(const std::vector<VARP>& vars, bool forceCPU = false);
+    static void compute(const std::vector<VARP>& vars, bool forceCPU = false);
 
     size_t linkNumber() const;
     const std::vector<WeakEXPRP>& toExprs() const;
@@ -155,6 +168,9 @@ public:
         mFrom = expr;
         mFromIndex = index;
     }
+
+    // Can't modify the tensor from this interface
+    const Tensor* getTensor() const;
 private:
     Variable(EXPRP expr, int index) {
         mFrom      = expr;
@@ -164,18 +180,25 @@ private:
     void* readInternal(bool forShape = false);
     void* writeInternal(bool inform=true);
     void informDirty();
+    void writeScaleInternal(float scaleValue, float zeroPoint, bool inform = true);
 
     friend class Expr;
     EXPRP mFrom;
     int mFromIndex;
 };
-
 class MNN_PUBLIC Expr {
 public:
     struct Inside;
-    static EXPRP create(Variable::Info&& info);
+    enum MemoryType {
+        COPY,
+        MOVE,
+        REF
+    };
+    static EXPRP create(Tensor* tensor, bool own = false);
+
+    static EXPRP create(Variable::Info&& info, const void* ptr, VARP::InputType type, MemoryType copy = COPY);
     static EXPRP create(const OpT* op, std::vector<VARP> inputs, int outputSize = 1);
-    static EXPRP create(std::pair<std::shared_ptr<char>, int> extra, std::vector<VARP>&& inputs, int outputSize = 1);
+    static EXPRP create(std::shared_ptr<BufferStorage> extra, std::vector<VARP>&& inputs, int outputSize = 1);
     static EXPRP create(std::unique_ptr<OpT>&& op, std::vector<VARP> inputs, int outputSize = 1) {
         return create(op.get(), inputs, outputSize);
     }
@@ -188,7 +211,7 @@ public:
         return mInputs;
     }
     int outputSize() const {
-        return mOutputNames.size();
+        return (int)mOutputNames.size();
     }
     static void replace(EXPRP oldExpr, EXPRP newExpr);
     bool requireInfo();
@@ -200,12 +223,6 @@ public:
     }
     ~Expr();
 
-    bool visited() const {
-        return mVisited;
-    }
-    void setVisited(bool visited) {
-        mVisited = visited;
-    }
     const std::string& name() const {
         return mName;
     }
@@ -214,9 +231,10 @@ public:
     }
 
     VARP::InputType inputType() const {return mType;}
+    /** Internal Usage Begin */
     Variable::Info* outputInfo(int index) const;
-    std::pair<std::shared_ptr<char>, int> extra() const {
-        return std::make_pair(mExtraBuffer, mOpBufferSize);
+    std::shared_ptr<BufferStorage> extra() const {
+        return mStorage;
     }
     bool setInfoDirty();
     std::shared_ptr<Inside> inside() const {
@@ -225,19 +243,21 @@ public:
     bool valid() const {
         return mValid;
     }
-
-    void setEntry(const std::vector<VARP>& entries) {
-        mEntries = entries;
+    bool visited() const {
+        return mVisited;
+    }
+    void setVisited(bool visited) {
+        mVisited = visited;
     }
 
-    const std::vector<VARP>& getEntry() const {
-        return mEntries;
-    }
+    /** Internal Usage End */
+
 
 private:
     static void _addLinkForInputs(EXPRP expr);
 
     Expr(int outputSize);
+    Expr(Tensor* tensor, bool own = false);
 
     friend class Variable;
     friend class VARP;
@@ -247,16 +267,14 @@ private:
     std::vector<std::string> mOutputNames;
 
     bool mValid = true;
-    std::shared_ptr<char> mExtraBuffer;
-    int mOpBufferSize = 0;
+    std::shared_ptr<BufferStorage> mStorage;
     std::string mName;
     std::shared_ptr<Inside> mInside = nullptr;
     bool mVisited                   = false;
     std::vector<WeakEXPRP> mTo;
+    bool mCanDecompose = true;
+    friend class ExprModule;
 
-    // Only the enter input has entries, and it helps to get info for enter
-    // input expression.
-    std::vector<VARP> mEntries;
 };
 } // namespace Express
 } // namespace MNN

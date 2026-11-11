@@ -18,7 +18,7 @@ MNN::OpParameter CastOnnx::type() {
 }
 
 void CastOnnx::run(MNN::OpT *dstOp, const onnx::NodeProto *onnxNode,
-                   std::vector<const onnx::TensorProto *> initializers) {
+                   OnnxScope* scope) {
     std::unique_ptr<MNN::CastParamT> castParam(new MNN::CastParamT);
 
     // not to use srcT parameter!
@@ -35,6 +35,9 @@ void CastOnnx::run(MNN::OpT *dstOp, const onnx::NodeProto *onnxNode,
     }
 
     castParam->dstT   = onnxOpConverter::convertDataType(castTo);
+    if (castTo == onnx::TensorProto_DataType_FLOAT16) {
+        castParam->dstT = MNN::DataType_DT_FLOAT;
+    }
     dstOp->main.value = castParam.release();
 }
 

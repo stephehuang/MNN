@@ -12,12 +12,12 @@
 
 DECLARE_OP_COVERTER(PoolingTflite);
 
-MNN::OpType PoolingTflite::opType(bool quantizedModel) {
+MNN::OpType PoolingTflite::opType(int quantizedModel) {
     if (quantizedModel)
         return MNN::OpType_QuantizedAvgPool;
     return MNN::OpType_Pooling;
 }
-MNN::OpParameter PoolingTflite::type(bool quantizedModel) {
+MNN::OpParameter PoolingTflite::type(int quantizedModel) {
     if (quantizedModel)
         return MNN::OpParameter_QuantizedAvgPool;
     return MNN::OpParameter_Pool;
@@ -26,10 +26,31 @@ MNN::OpParameter PoolingTflite::type(bool quantizedModel) {
 void PoolingTflite::run(MNN::OpT* dstOp, const std::unique_ptr<tflite::OperatorT>& tfliteOp,
                         const std::vector<std::unique_ptr<tflite::TensorT>>& tfliteTensors,
                         const std::vector<std::unique_ptr<tflite::BufferT>>& tfliteModelBuffer,
-                        const std::vector<std::unique_ptr<tflite::OperatorCodeT>>& tfliteOpSet, bool quantizedModel) {
+                        const std::vector<std::unique_ptr<tflite::OperatorCodeT>>& tfliteOpSet, int quantizedModel) {
     const auto& tflitePoolOption = tfliteOp->builtin_options.AsPool2DOptions();
+    if (nullptr == tflitePoolOption) {
+        DLOG(ERROR) << "AVERAGE_POOL_2D/MAX_POOL_2D operator carries no Pool2DOptions";
+        dstOp->type = MNN::OpType_MAX;
+        return;
+    }
+    const int outputIndex    = tfliteOp->outputs[0];
+    const auto& outputTensor = tfliteTensors[outputIndex];
+    if (outputTensor->type == tflite::TensorType_INT8) {
+        quantizedModel = 2;
+        dstOp->type = MNN::OpType_Pooling;
+        dstOp->main.type = MNN::OpParameter_Pool;
+    } else if (outputTensor->type == tflite::TensorType_UINT8) {
+        quantizedModel = 1;
+        dstOp->type = MNN::OpType_QuantizedAvgPool;
+        dstOp->main.type = MNN::OpParameter_QuantizedAvgPool;
+    } else {
+        MNN_ASSERT(outputTensor->type == tflite::TensorType_FLOAT32);
+        quantizedModel = 0;
+        dstOp->type = MNN::OpType_Pooling;
+        dstOp->main.type = MNN::OpParameter_Pool;
+    }
 
-    if (quantizedModel) {
+    if (quantizedModel == 1) {
         auto quantizedAvgPoolQuan         = new MNN::QuantizedAvgPoolT;
         quantizedAvgPoolQuan->modelFormat = MNN::ModeFormat_TFLITE;
 
@@ -69,7 +90,7 @@ void PoolingTflite::run(MNN::OpT* dstOp, const std::unique_ptr<tflite::OperatorT
 
         poolParam->type    = MNN::PoolType_AVEPOOL;
         const auto opIndex = tfliteOp->opcode_index;
-        auto opType        = tfliteOpSet[opIndex]->builtin_code;
+        auto opType        = liteOpConverter::getOpCode(tfliteOpSet[opIndex].get());
         if (opType == tflite::BuiltinOperator_MAX_POOL_2D) {
             poolParam->type = MNN::PoolType_MAXPOOL;
         }

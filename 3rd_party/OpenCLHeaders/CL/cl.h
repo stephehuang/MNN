@@ -29,13 +29,8 @@
 #ifndef __OPENCL_CL_H
 #define __OPENCL_CL_H
 
-#ifdef __APPLE__
-#include <OpenCL/cl_version.h>
-#include <OpenCL/cl_platform.h>
-#else
 #include <CL/cl_version.h>
 #include <CL/cl_platform.h>
-#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -837,6 +832,7 @@ typedef struct _cl_buffer_region {
 #define CL_PROFILING_COMMAND_COMPLETE               0x1284
 #endif
 
+#define CL_DEVICE_NUM_THREADS_PER_EU_INTEL 0x4255
 /********************************************************************************************************/
 
 /* Platform API */

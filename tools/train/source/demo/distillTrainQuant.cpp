@@ -16,7 +16,7 @@
 #include "DemoUnit.hpp"
 #include "NN.hpp"
 #include "SGD.hpp"
-#include "PipelineModule.hpp"
+#include "module/PipelineModule.hpp"
 #define MNN_OPEN_TIME_TRACE
 #include <MNN/AutoTime.hpp>
 #include <functional>
@@ -76,8 +76,7 @@ void _test(std::shared_ptr<Module> optmized, const ImageDataset::ImageConfig* co
 }
 
 void _train(std::shared_ptr<Module> origin, std::shared_ptr<Module> optmized, std::string inputName, std::string outputName) {
-    std::shared_ptr<SGD> sgd(new SGD);
-    sgd->append(optmized->parameters());
+    std::shared_ptr<SGD> sgd(new SGD(optmized));
     sgd->setMomentum(0.9f);
     sgd->setWeightDecay(0.00004f);
 
@@ -85,7 +84,7 @@ void _train(std::shared_ptr<Module> origin, std::shared_ptr<Module> optmized, st
     int resizeHeight           = 224;
     int resizeWidth            = 224;
     std::vector<float> means = {127.5, 127.5, 127.5};
-    std::vector<float> scales = {1/127.5, 1/127.5, 1/127.5};
+    std::vector<float> scales = {1/127.5f, 1/127.5f, 1/127.5f};
     std::vector<float> cropFraction = {0.875, 0.875}; // center crop fraction for height and width
     bool centerOrRandomCrop = false; // true for random crop
     std::shared_ptr<ImageDataset::ImageConfig> datasetConfig(ImageDataset::ImageConfig::create(converImagesToFormat, resizeHeight, resizeWidth, scales, means, cropFraction, centerOrRandomCrop));
@@ -210,10 +209,9 @@ public:
             BackendConfig config;
             exe->setGlobalExecutorConfig(MNN_FORWARD_CPU, config, 4);
         }
-        std::shared_ptr<Module> model(PipelineModule::extract(inputs, logitsOutput, true));
-        PipelineModule::turnQuantize(model.get(), bits);
-        ((PipelineModule*)model.get())->toTrainQuant(bits);
-        std::shared_ptr<Module> originModel(PipelineModule::extract(inputs, logitsOutput, false));
+        std::shared_ptr<Module> model(NN::extract(inputs, logitsOutput, true));
+        NN::turnQuantize(model.get(), bits);
+        std::shared_ptr<Module> originModel(NN::extract(inputs, logitsOutput, false));
         _train(originModel, model, inputName, originOutputName);
         return 0;
     }

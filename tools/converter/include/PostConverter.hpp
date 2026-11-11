@@ -14,16 +14,16 @@
 #include <stdlib.h>
 #include <fstream>
 #include <sstream>
+#include <MNN/MNNDefine.h>
 #include "MNN_generated.h"
 #include "flatbuffers/idl.h"
 #include "flatbuffers/minireflect.h"
 #include "flatbuffers/util.h"
-
-#include "MNN_generated.h"
+#include "config.hpp"
 
 /**
  *@brief optimize MNN net
  */
-std::unique_ptr<MNN::NetT> optimizeNet(std::unique_ptr<MNN::NetT>& netT, bool forTraining);
+std::unique_ptr<MNN::NetT> optimizeNet(std::unique_ptr<MNN::NetT>& netT, bool forTraining, modelConfig& config, const std::vector<std::string>& expectPasses);
 
 #endif // OPTIMIZER_HPP

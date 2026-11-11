@@ -17,14 +17,26 @@ namespace MNN {
 class MetalConvolutionDepthwise : public MetalConvolutionCommon {
 public:
     MetalConvolutionDepthwise(Backend *backend, const MNN::Op *op);
+    MetalConvolutionDepthwise(Backend *backend, const MNN::Op *op, bool dynamicWeight);
+    MetalConvolutionDepthwise(Backend *backend, const MNN::Op *op, std::shared_ptr<MNN::Tensor> weight,
+                              std::shared_ptr<MNN::Tensor> bias);
     virtual ~MetalConvolutionDepthwise() = default;
     virtual ErrorCode onResize(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override;
+    virtual bool onClone(Backend* bn, const Op* op, Execution** dst) override;
 
 protected:
-    virtual ErrorCode onQuantized(const Tensor *input, const Tensor *output) override;
-    virtual ErrorCode onFloat(const Tensor *input, const Tensor *output) override;
-    virtual id<MTLBuffer> weightForQuantized(int group, int oc, int ic, int kh, int kw, const int8_t *src) override;
-    virtual id<MTLBuffer> weightForFloat(int group, int oc, int ic, int kh, int kw, const float *src) override;
+    virtual void onEncode(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs, id<MTLComputeCommandEncoder> encoder) override;
+    virtual std::shared_ptr<MNN::Tensor> weightTransform(int group, int oc, int ic, int kh, int kw, const float *src, bool int8Weight=false, bool int4Weight=false, id<MTLBuffer> srcGpuBuffer=nil, int subBits=0) override;
+private:
+    bool mDynamicWeight = false;
+    id<MTLComputePipelineState> mWeightTransformPipeline = nil;
+    id<MTLComputePipelineState> mBiasTransformPipeline = nil;
+    id<MTLBuffer> mWeightTransformConstBuffer = nil;
+    id<MTLBuffer> mBiasTransformConstBuffer = nil;
+    std::pair<MTLSize, MTLSize> mWeightTransformThreads;
+    std::pair<MTLSize, MTLSize> mBiasTransformThreads;
+    id<MTLComputePipelineState> mPipeline;
+    std::pair<MTLSize, MTLSize> mThreads;
 };
 
 } // namespace MNN

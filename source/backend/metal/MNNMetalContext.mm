@@ -7,88 +7,108 @@
 //
 
 #import "backend/metal/MNNMetalContext.h"
+#import "backend/metal/MetalBackend.hpp"
 #import "core/Macro.h"
-#import "core/Macro.h"
-
+#import <sys/utsname.h>
+#import <mach/mach_time.h>
+//#define MNN_OPEN_TIME_TRACE
+#include <MNN/AutoTime.hpp>
 #if MNN_METAL_ENABLED
+#include "ShaderMap.hpp"
+#include <sstream>
 
 using namespace MNN;
 
 @interface MNNMetalContext ()
 // public
 @property (strong, nonatomic) id<MTLDevice> device;
-@property (strong, nonatomic) id<MTLCommandQueue> commandQueue;
-@property (strong, nonatomic) id<MTLCommandBuffer> commandBuffer;
-@property (assign, nonatomic) NSUInteger maxThreadgroupMemoryLength;
+@property (assign, nonatomic) BOOL isIphone;
 // private
-@property (strong, nonatomic) NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *caches;
-@property (strong, nonatomic) NSMutableArray<id<MTLCommandBuffer>> *waitings;
-@property (strong, nonatomic) id<MTLLibrary> library;
-@property (strong, nonatomic) id<MTLHeap> sharedHeap NS_AVAILABLE_IOS(10.0);
-@property (strong, nonatomic) id<MTLHeap> privateHeap NS_AVAILABLE_IOS(10.0);
+@property (strong, nonatomic) NSDictionary<NSString *, id<MTLComputePipelineState>> *cachesFp32;
+@property (strong, nonatomic) NSDictionary<NSString *, id<MTLComputePipelineState>> *cachesFp16;
 @end
 
 @implementation MNNMetalContext
 
-+ (id<MTLDevice>)device {
-    static id<MTLDevice> device = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        device = MTLCreateSystemDefaultDevice();
-    });
-    return device;
+static void createLibrary(id<MTLDevice> device, NSMutableDictionary<NSString *, id<MTLComputePipelineState>>* libraryMap, bool usefp16) {
+    AUTOTIME;
+    ShaderMap shader;
+    auto first = shader.search("shader_MetalDefine_metal");
+    auto second = shader.search("shader_MetalConvolutionActivation_metal");
+    auto& raw = shader.getRaw();
+    for (auto& iter : raw) {
+        std::ostringstream total;
+        if (iter.first == "shader_MetalDefine_metal") {
+            continue;
+        }
+        if (iter.first == "shader_MetalConvolutionActivation_metal") {
+            continue;
+        }
+        if (!usefp16) {
+            total << "#define MNN_METAL_FULL_PRECISION 1\n";
+        } else {
+            total << "#define MNN_METAL_FULL_PRECISION 0\n";
+        }
+        total << first << "\n" << second << "\n" << iter.second;
+        auto totalString = total.str();
+        auto totalNSString = [[NSString alloc] initWithUTF8String:totalString.c_str()];
+        NSError *err = nil;
+
+        auto library = [device newLibraryWithSource:totalNSString options:nil error:&err];
+        if (nil == library) {
+            if (err) {
+                printf("Error Key = %s\n", iter.first.c_str());
+                NSLog(@"Warning: Metallib Library error: %@", err);
+            }
+            [libraryMap removeAllObjects];
+            libraryMap = nil;
+            return;
+        }
+        auto functionNames = [library functionNames];
+        for(int i=0; i<functionNames.count ; i++) {
+            id<MTLFunction> function = [library newFunctionWithName:functionNames[i]];
+            if (!function) {
+                MNN_ERROR("Create Function in metal error\n");
+                continue;
+            }
+
+            NSError *error = nil;
+            auto result = [device newComputePipelineStateWithFunction:function error:&error];
+            libraryMap[functionNames[i]] = result;
+        }
+    }
 }
 
-+ (id<MTLLibrary>)library {
-    static id<MTLLibrary> library = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-#if TARGET_OS_IOS
-        NSString *path = [NSBundle.mainBundle pathForResource:@"mnn" ofType:@"metallib"];
-#else
-        NSString *path = @"mnn.metallib";
-#endif
-        library = path ? [self.device newLibraryWithFile:path error:NULL] : [self.device newDefaultLibrary];
-        if (nil == library) {
-            MNN_ERROR("Can't load mnn.metallib\n");
-        }
-    });
-    return library;
++ (BOOL)isIphone{
+    struct utsname systemInfo;
+    uname(&systemInfo);
+    NSString *deviceString = [NSString stringWithCString:systemInfo.machine encoding:NSASCIIStringEncoding];
+    NSString *subString = @"iPhone";
+    NSRange range = [deviceString rangeOfString:subString];
+    if (range.location != NSNotFound) {
+        return YES;
+    }
+    return NO;
+}
+
+
+- (BOOL) initWithSharedContext:(const MNNMetalSharedContext*)context dev:(id<MTLDevice>)device {
+    MNN_ASSERT(nullptr != context);
+    _device = context->device;
+    NSMutableDictionary* tmp_cachesFp16   = [NSMutableDictionary dictionary];
+    NSMutableDictionary* tmp_cachesFp32   = [NSMutableDictionary dictionary];
+    _isIphone = self.class.isIphone;
+    createLibrary(_device, tmp_cachesFp16, true);
+    createLibrary(_device, tmp_cachesFp32, false);
+    _cachesFp16 = [NSDictionary dictionaryWithDictionary:tmp_cachesFp16];
+    _cachesFp32 = [NSDictionary dictionaryWithDictionary:tmp_cachesFp32];
+    tmp_cachesFp16 = nil;
+    tmp_cachesFp32 = nil;
+    return nil != _device;
 }
 
 - (instancetype)init {
     self = [super init];
-    if (self) {
-        // public
-        _device        = self.class.device;
-        _commandQueue  = [_device newCommandQueue];
-        _commandBuffer = [_commandQueue commandBuffer];
-        if (@available(iOS 11.0, *)) {
-            _maxThreadgroupMemoryLength = _device.maxThreadgroupMemoryLength;
-        } else {
-            _maxThreadgroupMemoryLength = 16352; // 16352(16k - 32b) on iOS 11- according to feature set doc
-        }
-
-        // private
-        _caches   = [NSMutableDictionary dictionary];
-        _waitings = [NSMutableArray array];
-        _library  = self.class.library;
-        if (nil == _library) {
-            return nil;
-        }
-
-        if (@available(iOS 10.0, *)) {
-            MTLHeapDescriptor *shared = [[MTLHeapDescriptor alloc] init];
-            shared.storageMode        = MTLStorageModeShared;
-            shared.size               = 0x1000; // initial size
-            _sharedHeap               = [_device newHeapWithDescriptor:shared];
-
-            MTLHeapDescriptor *priv = [[MTLHeapDescriptor alloc] init];
-            priv.storageMode        = MTLStorageModePrivate;
-            priv.size               = 0x0800; // initial size
-            _privateHeap            = [_device newHeapWithDescriptor:priv];
-        }
-    }
     return self;
 }
 
@@ -115,139 +135,241 @@ using namespace MNN;
     return [_device newBufferWithBytes:bytes length:size options:[self optionForAccess:access]];
 }
 
-#pragma mark heap
-- (id<MTLBuffer>)newHeapBuffer:(NSUInteger)size access:(MNN::MetalAccess)access {
-    MTLResourceOptions options = [self optionForAccess:access];
-    if (@available(iOS 10.0, *)) {
-        id<MTLHeap> heap = access == CPUTransparent ? _privateHeap : _sharedHeap;
-        if (size <= [heap maxAvailableSizeWithAlignment:1]) {
-            id<MTLBuffer> buffer = [heap newBufferWithLength:size options:options];
-            if (buffer)
-                return buffer;
-        }
+- (id<MTLComputePipelineState>)pipelineWithName:(NSString *)name fp16:(BOOL)fp16 {
+    if (fp16) {
+        return _cachesFp16[name];
     }
-    return [_device newBufferWithLength:size options:options];
+    return _cachesFp32[name];
 }
 
-- (id<MTLBuffer>)newHeapBuffer:(NSUInteger)size bytes:(const void *)bytes access:(MNN::MetalAccess)access {
-    MNN_ASSERT(access != CPUReadWrite);
-    MTLResourceOptions options = [self optionForAccess:access];
-    if (@available(iOS 10.0, *)) {
-        id<MTLHeap> heap = access == CPUTransparent ? _privateHeap : _sharedHeap;
-        if (size <= [heap maxAvailableSizeWithAlignment:1]) {
-            id<MTLBuffer> buffer = [heap newBufferWithLength:size options:options];
-            if (buffer) {
-                memcpy(buffer.contents, bytes, size);
-                return buffer;
+- (id<MTLComputePipelineState>)pipelineWithSourceOption:(NSString *)source name:(NSString *)name options:(MTLCompileOptions *)options {
+    NSError *err = nil;
+    auto library = [_device newLibraryWithSource:source options:options error:&err];
+    if (err) {
+        NSLog(@"Warning: pipelineWithSource error: %@, source is: %@", err, source);
+    }
+    if (nil == library) {
+        return nil;
+    }
+    id<MTLFunction> function = [library newFunctionWithName:name];
+    if (nil == function) {
+        NSLog(@"Warning: Create function failed: %@", name);
+        return nil;
+    }
+    err = nil;
+    id<MTLComputePipelineState> result = [_device newComputePipelineStateWithFunction:function error:&err];
+    return result;
+}
+
+- (NSUInteger)timeUsed:(id<MTLCommandBuffer>)buffer {
+    // Get ns precision time
+    auto start = mach_absolute_time();
+    [buffer commit];
+    [buffer waitUntilCompleted];
+//    NSUInteger time = (NSUInteger)((buffer.GPUEndTime - buffer.GPUStartTime)* 1000000.f);//us
+    auto end = mach_absolute_time();
+
+    return (end-start)/1000;
+}
+
+- (id<MTLCommandBuffer>) newCmdBuffer:(MTLSize) localIndex queue:(id<MTLCommandQueue>) cmdqueue {
+    id<MTLCommandBuffer> cmdBuffer = [cmdqueue commandBuffer]; // create a new command buffer
+    std::string label = std::to_string((int)localIndex.width) + "_" + std::to_string((int)localIndex.height) + "_" + std::to_string((int)localIndex.depth);
+    cmdBuffer.label = [NSString stringWithCString:label.c_str() encoding:[NSString defaultCStringEncoding]];
+    return cmdBuffer;
+}
+
+bool getCloseThreadgroup(const std::map<std::string, std::vector<std::pair<std::vector<uint32_t>, std::tuple<std::vector<uint32_t>, std::vector<uint32_t>, uint32_t>>>> &tuneMap, const std::vector<uint32_t> &gws, const std::string &kernelName, std::tuple<std::vector<uint32_t>, std::vector<uint32_t>, uint32_t>& res){
+    float minScale = 0.1;
+    auto iter = tuneMap.find(kernelName);
+    if(iter == tuneMap.end()){
+        return false;
+    }
+    auto gwsAndLws = iter->second;
+    int size = gws.size();
+    uint32_t minPoint = UINT_MAX;
+    int index = -1;
+    for(int i = 0; i < gwsAndLws.size(); ++i){
+        uint32_t point = 0;
+        for(int j = 0; j < size; ++j){
+            point += std::abs(static_cast<int>(gws[j]) - static_cast<int>(gwsAndLws[i].first[j]));
+        }
+        if(point < minPoint){
+            index = i;
+            minPoint = point;
+        }
+    }
+    if(index != -1){
+        res = gwsAndLws[index].second;
+        return true;
+    }
+    return false;
+}
+
+- (std::tuple<MTLSize, MTLSize, NSUInteger>) getGridAndThreadgroup: (id<MTLComputePipelineState>)pipeline gid:(MTLSize)threads loop:(NSUInteger)count buffer:(NSArray *)buffers runtime:(MetalRuntime *) rt shaderName:(std::string) kernelName offsets:(int *) offset_arr queue:(id<MTLCommandQueue>) cmdqueue {
+    NSUInteger gid_x = threads.width;
+    NSUInteger gid_y = threads.height;
+    NSUInteger gid_z = threads.depth;
+    
+    auto& tunedThreadGroup = rt->getTunedThreadGroup();
+    std::vector<uint32_t> gws = {(uint32_t)gid_x, (uint32_t)gid_y, (uint32_t)gid_z};
+    std::pair<std::string, std::vector<uint32_t>> info = std::make_pair(kernelName, gws);
+    bool exactRes = tunedThreadGroup.find(info) != tunedThreadGroup.end();
+    std::tuple<std::vector<uint32_t>, std::vector<uint32_t>, uint32_t> tuneLwsRes;
+
+    bool closeRes = false;
+    if(!exactRes) {
+        auto& tunedThreadGroupVec = rt->getTunedThreadGroupVec();
+        if(getCloseThreadgroup(tunedThreadGroupVec, gws, kernelName, tuneLwsRes)){
+            closeRes = true;
+        }
+    } else {
+        tuneLwsRes = tunedThreadGroup[info];
+    }
+    if (exactRes || closeRes) {
+        //printf("conv2d1x1LocalWSOpt Found! gws:%d %d lws:%d %d\n", gws[0], gws[1], tunedLws[info][0], tunedLws[info][1]);
+        auto groupNum  = std::get<0>(tuneLwsRes);
+        auto groupSize = std::get<1>(tuneLwsRes);
+        auto timeCost  = std::get<2>(tuneLwsRes);
+
+        MTLSize _groupNum = {(NSUInteger)groupNum[0], (NSUInteger)groupNum[1], (NSUInteger)groupNum[2]};
+        MTLSize _groupSize = {(NSUInteger)groupSize[0], (NSUInteger)groupSize[1], (NSUInteger)groupSize[2]};
+
+        std::tuple<MTLSize, MTLSize, NSUInteger> result(_groupNum, _groupSize, (NSUInteger)timeCost);
+        return result;
+    }
+    std::pair<MTLSize, MTLSize> thread;//Grid and ThreadGroup
+    // set trick by computing
+    thread = [self computeBestGroupAndLocal:pipeline threads:threads];
+    
+    if(rt->getTuneLevel() == Heavy) {
+        count = 50;
+    }
+    NSUInteger min_time = UINT_MAX;
+    if(rt->getTuneLevel() != Never && buffers.count > 0)
+    {
+        //get original trick time
+        {
+            id<MTLCommandBuffer> commamd_buffer = [self newCmdBuffer:thread.second queue:cmdqueue];
+            id<MTLComputeCommandEncoder> encoder = [commamd_buffer computeCommandEncoder];
+            
+            int loop = count;
+            while(loop--) {
+                [encoder setComputePipelineState:pipeline];
+                for(NSUInteger idx = 0; idx < buffers.count; idx++) {
+                    [encoder setBuffer:[buffers objectAtIndex:idx] offset:offset_arr[idx] atIndex:idx];
+                }
+                MNN_ASSERT(thread.second.width >= 1);
+                MNN_ASSERT(thread.second.height >= 1);
+                MNN_ASSERT(thread.second.depth >= 1);
+
+                [encoder dispatchThreadgroups:thread.first threadsPerThreadgroup:thread.second];
+            }
+            [encoder endEncoding];
+            min_time = [self timeUsed :commamd_buffer];
+            //MNN_PRINT("orig prit: %d   us, %d %d %d\n", min_time, thread.second.width, thread.second.height, thread.second.depth);
+        }
+        
+        bool isMuchTime = (min_time > 8000) ? true : false;
+        NSUInteger magic_l = 1;
+        NSUInteger magic_z = 16;
+        NSUInteger magic_y = 4;
+        NSUInteger magic_x = 4;
+        
+        if(rt->getTuneLevel() == Heavy) {
+            magic_l = 2;
+            magic_z = UINT_MAX;
+            magic_y = UINT_MAX;
+            magic_x = UINT_MAX;
+        } else if(rt->getTuneLevel() == Wide) {
+            bool isMuchTime = (min_time > 5000) ? true : false;
+            magic_z = 16;
+            magic_y = (isMuchTime ? 4 : 16);
+            magic_x = (isMuchTime ? 4 : 16);
+        } else if(rt->getTuneLevel() == Normal) {
+            magic_z = 16;
+            magic_y = 4;
+            magic_x = 4;
+        } else if(rt->getTuneLevel() == Fast) {
+            magic_z = 4;
+            magic_y = 4;
+            magic_x = 4;
+        }
+        
+        for(NSUInteger z = 1; z < gid_z * magic_l && z <= magic_z; z *= 4) {
+            for(NSUInteger y = 1; y < gid_y * magic_l && y <= magic_y; y *= 4) {
+                for(NSUInteger x = 1; x < gid_x * magic_l && x <= magic_x; x *= 4) {
+                    if(x * y * z <= pipeline.maxTotalThreadsPerThreadgroup) {
+                        if(x==1 && y==1 && z==1) {
+                            continue;
+                        }
+                        MTLSize local = {x, y, z};
+                        MTLSize global = {UP_DIV(gid_x, x), UP_DIV(gid_y, y), UP_DIV(gid_z, z)};
+                        id<MTLCommandBuffer> commamd_buffer = [self newCmdBuffer:local queue:cmdqueue];
+                        id<MTLComputeCommandEncoder> encoder = [commamd_buffer computeCommandEncoder];
+
+                        int loop = count;
+                        while(loop--) {
+                            [encoder setComputePipelineState:pipeline];
+                            for(NSUInteger idx = 0; idx < buffers.count; idx++) {
+                                [encoder setBuffer:[buffers objectAtIndex:idx] offset:offset_arr[idx] atIndex:idx];
+                            }
+                                                
+                            [encoder dispatchThreadgroups:global threadsPerThreadgroup:local];
+                        }
+                        [encoder endEncoding];
+                        auto time = [self timeUsed :commamd_buffer];
+                        if(time < min_time) {
+                            min_time = time;
+                            thread.first = global;
+                            thread.second = local;
+                        }
+                    }
+                }
             }
         }
     }
-    return [_device newBufferWithBytes:bytes length:size options:options];
-}
+    //MNN_PRINT("tune prit: %d   us, %d %d %d\n", min_time, thread.second.width, thread.second.height, thread.second.depth);
 
-- (void)releaseHeapBuffer:(id<MTLBuffer>)buffer {
-    if (@available(iOS 10.0, *)) {
-        if (buffer.heap)
-            [buffer makeAliasable];
+    if (tunedThreadGroup.find(info) == tunedThreadGroup.end()) {
+        //MNN_PRINT("2dLocalWS %d Insert! gws:%d %d, lws:%d %d\n", (int)tunedLws.size(), gws[0], gws[1], lws_prefer[0], lws_prefer[1]);
+        std::vector<uint32_t> groupNum(3 ,0);
+        groupNum[0] = thread.first.width;
+        groupNum[1] = thread.first.height;
+        groupNum[2] = thread.first.depth;
+        
+        std::vector<uint32_t> groupSize(3 ,0);
+        groupSize[0] = thread.second.width;
+        groupSize[1] = thread.second.height;
+        groupSize[2] = thread.second.depth;
+
+        tunedThreadGroup.insert(std::make_pair(info, std::make_tuple(groupNum, groupSize, (uint32_t)min_time)));
     }
+
+    return std::make_tuple(thread.first, thread.second, min_time);
 }
 
-#pragma mark enqueue
-- (id<MTLFunction>)functionWithName:(NSString *)name {
-    if (!name)
-        return nil;
-    id<MTLFunction> result = [_library newFunctionWithName:name];
-#if MNN_METAL_DEBUG || MNN_METAL_BENCHMARK
-    if (@available(iOS 10.0, *))
-        result.label = name;
-#endif
-    return result;
-}
 
-- (id<MTLComputePipelineState>)pipelineWithName:(NSString *)name {
-    id<MTLComputePipelineState> result = _caches[name];
-    if (result)
-        return result;
-
-    id<MTLFunction> function = [self functionWithName:name];
-    if (!function)
-        return nil;
-
-    NSError *error = nil;
-    result         = [_device newComputePipelineStateWithFunction:function error:&error];
-#if MNN_METAL_DEBUG
-    if (error)
-        printf("[METAL] create pipeline error: %s\n", error.localizedDescription.UTF8String);
-#endif
-    if (result)
-        _caches[name] = result;
-    return result;
-}
-
-- (id<MTLComputeCommandEncoder>)encoder {
-    id<MTLComputeCommandEncoder> result = [_commandBuffer computeCommandEncoder];
-#if MNN_METAL_DEBUG || MNN_METAL_BENCHMARK
-    result.label = nil;
-#endif
-    return result;
-}
-
-- (MetalBandwidth)load:(NSString *)name encoder:(id<MTLComputeCommandEncoder>)encoder {
-    id<MTLComputePipelineState> pipeline = [self pipelineWithName:name];
-    [encoder setComputePipelineState:pipeline];
-#if MNN_METAL_DEBUG || MNN_METAL_BENCHMARK
-    if (!name) {
-    } else if (!encoder.label) {
-        encoder.label = name;
-    } else {
-        NSArray *components = [encoder.label componentsSeparatedByString:@","];
-        if (![components containsObject:name]) {
-            components = [components arrayByAddingObject:name];
+- (NSUInteger)PipelinetimeUsed: (id<MTLComputePipelineState>)pipeline global:(MTLSize)globals local:(MTLSize)locals loop:(NSUInteger)count buffer:(NSArray *)buffers queue:(id<MTLCommandQueue>) cmdqueue{
+    NSUInteger time = 0;
+    MTLSize local_size = {locals.width, locals.height, locals.depth};
+    MTLSize global_size = {globals.width, globals.height, globals.depth};
+    id<MTLCommandBuffer> commamd_buffer = [self newCmdBuffer:local_size queue:cmdqueue];
+    id<MTLComputeCommandEncoder> encoder = [commamd_buffer computeCommandEncoder];
+            
+    int loop = count;
+    while(loop--) {
+        [encoder setComputePipelineState:pipeline];
+        for(NSUInteger idx = 0; idx < buffers.count; idx++) {
+            [encoder setBuffer:[buffers objectAtIndex:idx] offset:0 atIndex:idx];
         }
-        encoder.label = [components componentsJoinedByString:@","];
+                
+        [encoder dispatchThreadgroups:global_size threadsPerThreadgroup:local_size];
     }
-#endif
-    return {pipeline.threadExecutionWidth, pipeline.maxTotalThreadsPerThreadgroup, NO};
-}
+    [encoder endEncoding];
+    time = [self timeUsed :commamd_buffer];
 
-#pragma mark dispatch
-- (void)commit {
-    if (_commandBuffer.status < MTLCommandBufferStatusCommitted) {
-        [_commandBuffer commit];
-        [_waitings addObject:_commandBuffer];
-        _commandBuffer = [_commandQueue commandBuffer]; // create a new command buffer
-    }
-}
-
-- (void)wait {
-    NSArray *buffers = _waitings.copy;
-    [_waitings removeAllObjects];
-
-    for (id<MTLCommandBuffer> buffer in buffers) {
-        if (buffer.status >= MTLCommandBufferStatusCompleted)
-            continue;
-
-#if MNN_METAL_BENCHMARK
-        NSTimeInterval begin = [NSDate timeIntervalSinceReferenceDate];
-        [buffer waitUntilCompleted];
-        NSTimeInterval end = [NSDate timeIntervalSinceReferenceDate];
-        if (@available(iOS 10.3, *)) {
-            printf("[METAL] commit costs: %.3fms\t(kernel: %.3fms, GPU: %.3fms)\n", (end - begin) * 1000.f,
-                   (buffer.kernelEndTime - buffer.kernelStartTime) * 1000.f,
-                   (buffer.GPUEndTime - buffer.GPUStartTime) * 1000.f);
-        } else {
-            printf("[METAL] commit costs: %.3fms\n", (end - begin) * 1000.f);
-        }
-#else
-        [buffer waitUntilCompleted];
-#endif
-
-#if MNN_METAL_DEBUG
-        if (buffer.error) {
-            printf("[METAL] %s\n", buffer.error.localizedDescription.UTF8String);
-        }
-#endif
-    }
+    return time;
 }
 
 static NSUInteger smallest_log2(NSUInteger integer) {
@@ -261,7 +383,16 @@ static NSUInteger smallest_log2(NSUInteger integer) {
     return power;
 }
 
-- (MTLSize)threadsPerGroupWithThreads:(MTLSize)t bandwidth:(MetalBandwidth)bw {
+- (std::pair<MTLSize, MTLSize>)computeBestGroupAndLocal:(id<MTLComputePipelineState>) bw threads:(MTLSize)t {
+    auto local = [self computeBestGroup:bw threads:t];
+    local.width = ALIMAX(local.width, 1);
+    local.height = ALIMAX(local.height, 1);
+    local.depth = ALIMAX(local.depth, 1);
+    auto globalSize = MTLSizeMake(UP_DIV(t.width, local.width), UP_DIV(t.height, local.height), UP_DIV(t.depth, local.depth));
+    return std::make_pair(globalSize, local);
+}
+
+- (MTLSize)computeBestGroup:(id<MTLComputePipelineState>) bw threads:(MTLSize)t {
     auto pwarp = smallest_log2(bw.threadExecutionWidth);
     auto px = smallest_log2(t.width), sx = (NSUInteger)ceil(log2(t.width));
     auto py = smallest_log2(t.height), sy = (NSUInteger)ceil(log2(t.height));
@@ -287,7 +418,7 @@ static NSUInteger smallest_log2(NSUInteger integer) {
 
     // on xyz (for most shaders do not protect gid.z, z axis must be accurately match)
     auto pz = smallest_log2(t.depth);
-    auto sz = bw.zAxisProtected ? ceil(log2(t.depth)) : pz;
+    auto sz = pz;
     if (px + py + pz >= pwarp) {
         NSUInteger x = pow(2, px), y = pow(2, py);
         return {x, y, bw.threadExecutionWidth / x / y};
@@ -298,48 +429,7 @@ static NSUInteger smallest_log2(NSUInteger integer) {
         NSUInteger z = pow(2, sz);
         return {t.width, t.height, z};
     }
-}
 
-- (void)dispatchEncoder:(id<MTLComputeCommandEncoder>)encoder
-                threads:(MTLSize)threads
-              bandwidth:(MetalBandwidth)bandwidth {
-    [self dispatchEncoder:encoder
-                  threads:threads
-          threadsPerGroup:[self threadsPerGroupWithThreads:threads bandwidth:bandwidth]
-                bandwidth:bandwidth];
-}
-
-- (void)dispatchEncoder:(id<MTLComputeCommandEncoder>)encoder
-                threads:(MTLSize)threads
-        threadsPerGroup:(MTLSize)threadsPerGroup
-              bandwidth:(MetalBandwidth)bandwidth {
-#if MNN_METAL_DEBUG
-    if (threads.width == 0 || threads.height == 0 || threads.depth == 0 || threadsPerGroup.width == 0 ||
-        threadsPerGroup.height == 0 || threadsPerGroup.depth == 0) {
-        printf("[METAL] dispatch error %td %td %td / %td %td %td\n", threads.width, threads.height, threads.depth,
-               threadsPerGroup.width, threadsPerGroup.height, threadsPerGroup.depth);
-    }
-#endif
-
-    //    NSLog(@"dispatch {%td %td %td} with {%td %td %td}",
-    //          threads.width, threads.height, threads.depth,
-    //          threadsPerGroup.width, threadsPerGroup.height, threadsPerGroup.depth);
-    threadsPerGroup.width  = MIN(threadsPerGroup.width, bandwidth.maxThreadsPerThreadgroup);
-    threadsPerGroup.height = MIN(threadsPerGroup.height, bandwidth.maxThreadsPerThreadgroup);
-    threadsPerGroup.depth  = MIN(threadsPerGroup.depth, bandwidth.maxThreadsPerThreadgroup);
-#ifdef MNN_BUILD_FOR_IOS
-    if (@available(iOS 11.0, *)) {
-        if ([_device supportsFeatureSet:MTLFeatureSet_iOS_GPUFamily4_v1]) {
-            [encoder dispatchThreads:threads threadsPerThreadgroup:threadsPerGroup];
-            return;
-        }
-    }
-#endif
-    MTLSize groups = {
-        UP_DIV(threads.width, threadsPerGroup.width), UP_DIV(threads.height, threadsPerGroup.height),
-        UP_DIV(threads.depth, threadsPerGroup.depth),
-    };
-    [encoder dispatchThreadgroups:groups threadsPerThreadgroup:threadsPerGroup];
 }
 
 #if MNN_METAL_DEBUG
@@ -366,9 +456,9 @@ void printBuffer(const void *content, unsigned long bytes, const char *fmt) {
                     type:buffer.type.code
                     bits:buffer.type.bits];
     } else if (buffer.type.code == halide_type_float) {
-        [self printBuffer:(__bridge id<MTLBuffer>)(void *)buffer.device type:buffer.type.code bits:16];
+        [self printBuffer:(id<MTLBuffer>)((MetalRuntimeAllocator::MetalBufferAlloc *)buffer.device)->getBuffer() type:buffer.type.code bits:16];
     } else {
-        [self printBuffer:(__bridge id<MTLBuffer>)(void *)buffer.device type:buffer.type.code bits:buffer.type.bits];
+        [self printBuffer:(id<MTLBuffer>)((MetalRuntimeAllocator::MetalBufferAlloc *)buffer.device)->getBuffer() type:buffer.type.code bits:buffer.type.bits];
     }
 }
 
@@ -395,7 +485,7 @@ void printBuffer(const void *content, unsigned long bytes, const char *fmt) {
         }
     } else if (type == halide_type_float) {
         if (bits == 16) { // half
-            printBuffer<metal_float>(bytes, length, "%.4f");
+            printBuffer<__fp16>(bytes, length, "%.4f");
         } else { // float
             printBuffer<float>(bytes, length, "%.4f");
         }

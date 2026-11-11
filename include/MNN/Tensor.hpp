@@ -6,8 +6,8 @@
 //  Copyright © 2018, Alibaba Group Holding Limited
 //
 
-#ifndef Tensor_hpp
-#define Tensor_hpp
+#ifndef MNN_Tensor_hpp
+#define MNN_Tensor_hpp
 
 #include <vector>
 #include <MNN/HalideRuntime.h>
@@ -44,6 +44,13 @@ public:
         HANDLE_STRING = 1
     };
 
+    /** Tensor map type : Read or Write*/
+    enum MapType {
+        /** map Tensor for writing data*/
+        MAP_TENSOR_WRITE = 0,
+        MAP_TENSOR_READ = 1
+    };
+
 public:
     /**
      * @brief create a tensor with dimension size and type without acquire memory for data.
@@ -65,6 +72,7 @@ public:
     ~Tensor();
 
 private:
+    Tensor(bool deepCopy, const Tensor* tensor);
     // remove all assignment operator
     Tensor(const Tensor& tensor)  = delete;
     Tensor(const Tensor&& tensor) = delete;
@@ -117,6 +125,18 @@ public:
         return create(shape, halide_type_of<T>(), data, dimType);
     }
 
+    /**
+     * @brief copy tensor.
+     * @param src     tensor
+     * @param deepCopy whether create new content and copy, currently only support deepCopy = false
+     */
+    static Tensor* clone(const Tensor* src, bool deepCopy = false);
+
+    /**
+     * @brief delete tensor.
+     * @param src     tensor
+     */
+    static void destroy(Tensor* tensor);
 public:
     /**
      * @brief for DEVICE tensor, copy data from given host tensor.
@@ -207,6 +227,7 @@ public:
      * @return bytes needed to store data
      */
     int size() const;
+    size_t usize() const;
 
     /**
      * @brief calculate number of elements needed to store data taking reordering flag into account.
@@ -254,17 +275,39 @@ public:
         mBuffer.dim[index].extent = length;
     }
 
+    /**
+     * @brief For GPU and Other Device, get memory directly, see MNNSharedContext for detail
+     * @return Success or not. If type != tensor's backend's type or type is cpu , return false
+     */
+    bool getDeviceInfo(void* dst, int forwardType) const;
+
 public:
     /**
      * @brief print tensor data. for DEBUG use only.
      */
     void print() const;
-    
+
     /**
      *@brief print tensor shape
      */
     void printShape() const;
 
+public:
+    /**
+     * @brief map/umap GPU Tensor, to get host ptr
+     */
+    void* map(MapType mtype, DimensionType dtype);
+    void unmap(MapType mtype, DimensionType dtype, void* mapPtr);
+    /**
+     * @brief wait until the tensor is ready to read / write
+     * @param mtype wait for read or write
+     * @param finish wait for command flush or finish
+     */
+    int wait(MapType mtype, bool finish);
+    /**
+     * @brief set GPU tensor device ptr, and inform memory type
+     */
+    bool setDevicePtr(const void* devicePtr, int memoryType);
 private:
     halide_buffer_t mBuffer;
     struct InsideDescribe* mDescribe;

@@ -9,29 +9,30 @@
 #ifndef MobilenetV2_hpp
 #define MobilenetV2_hpp
 
-#include <Initializer.hpp>
+#include "Initializer.hpp"
 #include <vector>
 #include "MobilenetUtils.hpp"
-#include "Module.hpp"
+#include <MNN/expr/Module.hpp>
 #include "NN.hpp"
+#include <algorithm>
 
 namespace MNN {
 namespace Train {
 namespace Model {
 
-class MNN_PUBLIC MobilenetV2 : public Module {
+class MNN_PUBLIC MobilenetV2 : public Express::Module {
 public:
     // use tensorflow numClasses = 1001, which label 0 means outlier of the original 1000 classes
     // so you maybe need to add 1 to your true labels, if you are testing with ImageNet dataset
-    MobilenetV2(int numClasses = 1001, float widthMult = 1.0f, int divisor = 8);
+    MobilenetV2(int numClasses = 1001, float widthMult = 1.0f, int divisor = 8, bool useBn = true);
 
     virtual std::vector<Express::VARP> onForward(const std::vector<Express::VARP> &inputs) override;
 
-    std::shared_ptr<Module> firstConv;
-    std::vector<std::shared_ptr<Module> > bottleNeckBlocks;
-    std::shared_ptr<Module> lastConv;
-    std::shared_ptr<Module> dropout;
-    std::shared_ptr<Module> fc;
+    std::shared_ptr<Express::Module> firstConv;
+    std::vector<std::shared_ptr<Express::Module> > bottleNeckBlocks;
+    std::shared_ptr<Express::Module> lastConv;
+    std::shared_ptr<Express::Module> dropout;
+    std::shared_ptr<Express::Module> fc;
 };
 
 } // namespace Model

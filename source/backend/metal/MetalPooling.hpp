@@ -9,19 +9,18 @@
 #ifndef MetalPooling_hpp
 #define MetalPooling_hpp
 
-#import "core/Execution.hpp"
+#import "MetalExecution.hpp"
 #import "MNN_generated.h"
-#import "MetalDefine.h"
 
 #if MNN_METAL_ENABLED
 namespace MNN {
 
-class MetalPooling : public Execution {
+class MetalPooling : public MetalExecution {
 public:
     MetalPooling(Backend *backend, const Pool *pooling);
     virtual ~MetalPooling() = default;
     virtual ErrorCode onResize(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override;
-    virtual ErrorCode onExecute(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override;
+    virtual void onEncode(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs, id<MTLComputeCommandEncoder> encoder) override;
 
 private:
     bool mGlobal;
@@ -32,7 +31,13 @@ private:
     int mStrideY;
     int mPadX;
     int mPadY;
+    // AvgPoolCountType resolved the way CPUPool does: DEFAULT means INCLUDE_PADDING under
+    // CAFFE padding and EXCLUDE_PADDING otherwise.
+    bool mCountIncludePadding;
     id<MTLBuffer> mConstBuffer;
+    MTLSize mGroup;
+    MTLSize mLocal;
+    id<MTLComputePipelineState> mPipeline;
 };
 
 } // namespace MNN

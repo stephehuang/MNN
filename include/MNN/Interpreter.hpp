@@ -6,11 +6,12 @@
 //  Copyright © 2018, Alibaba Group Holding Limited
 //
 
-#ifndef Interpreter_hpp
-#define Interpreter_hpp
+#ifndef MNN_Interpreter_hpp
+#define MNN_Interpreter_hpp
 
 #include <functional>
 #include <map>
+#include <memory>
 #include <string>
 #include <MNN/ErrorCode.hpp>
 #include <MNN/MNNForwardType.h>
@@ -24,8 +25,11 @@ struct ScheduleConfig {
     std::vector<std::string> saveTensors;
     /** forward type */
     MNNForwardType type = MNN_FORWARD_CPU;
-    /** number of threads in parallel */
-    int numThread = 4;
+    /** CPU:number of threads in parallel , Or GPU: mode setting*/
+    union {
+        int numThread = 4;
+        int mode;
+    };
 
     /** subpath to run */
     struct Path {
@@ -43,7 +47,7 @@ struct ScheduleConfig {
             Op = 0,
 
             /**
-             * Tensor Mode (NOT supported yet)
+             * Tensor Mode
              * - inputs means the inputs tensors, can NOT be empty.
              * - outputs means the outputs tensors, can NOT be empty.
              * It will find the pipeline that compute outputs from inputs.
@@ -67,6 +71,7 @@ class Session;
 struct Content;
 class Tensor;
 class Backend;
+class Runtime;
 
 class MNN_PUBLIC OperatorInfo {
     struct Info;
@@ -89,6 +94,13 @@ protected:
 
 typedef std::function<bool(const std::vector<Tensor*>&, const std::string& /*opName*/)> TensorCallBack;
 typedef std::function<bool(const std::vector<Tensor*>&, const OperatorInfo*)> TensorCallBackWithInfo;
+typedef std::pair< std::map<MNNForwardType, std::shared_ptr<Runtime>>,  std::shared_ptr<Runtime>> RuntimeInfo;
+
+/**
+ * @brief get mnn version info.
+ * @return mnn version string.
+ */
+MNN_PUBLIC const char* getVersion();
 
 /** net data holder. multiple sessions could share same net. */
 class MNN_PUBLIC Interpreter {
@@ -108,7 +120,201 @@ public:
     static Interpreter* createFromBuffer(const void* buffer, size_t size);
     ~Interpreter();
 
+    /**
+     * @brief destroy Interpreter
+     * @param model    given Interpreter to release.
+     */
+    static void destroy(Interpreter* net);
+
+    enum SessionMode {
+        /** About CallBack, Default Session_Debug*/
+        /** runSessionWithCallBack is allowed and can get internal op info*/
+        Session_Debug = 0,
+        /** runSessionWithCallBack is not valid and can't get any info of op in session*/
+        Session_Release = 1,
+
+        /** About input tenosr, Default Session_Input_Inside*/
+        /** The input tensor is alloced by session, input data after session resized*/
+        Session_Input_Inside = 2,
+        /** The input tensor is alloced by user, set input data before session resize*/
+        Session_Input_User = 3,
+
+        /** The output tensor depends on session, and can't be separate used*/
+        Session_Output_Inside = 4,
+        /** The output tensor can be separated from session*/
+        Session_Output_User = 5,
+
+        /** Try Resize Session when create Session or not, default direct: */
+        Session_Resize_Direct = 6,
+        Session_Resize_Defer = 7,
+
+        /** Determine the Execution's forward type is determine by user or auto determine */
+        Session_Backend_Fix = 8, // Use the backend user set, when not support use default backend
+        Session_Backend_Auto = 9, // Auto Determine the Op type by MNN
+
+        /** Determine static memory whether recyle in resizeSession or just cache the memory */
+        Session_Memory_Collect = 10, // Recycle static memory when session resize in case memory explosion
+        Session_Memory_Cache = 11, // Cache the static memory for next forward usage
+
+        /** Determine whether use codegen function */
+        Session_Codegen_Disable = 12, // Disable codegen in case extra build codegen cost
+        Session_Codegen_Enable = 13, // Enable codegen
+
+        /** Dynamic Reisze Optimization */
+        Session_Resize_Check = 14, // Open Trace for resize
+        Session_Resize_Fix = 15, // Apply Resize Optimization
+
+        /** Set for Module's traceOrOptimize API.
+         Module_Forward_Seperate:
+         when inputs is not empty , Module's onForward will only infer shape and alloc memory.
+         when inputs is empty , Module's onForward will only runSession to compute content.
+         Default is Module_Forward_Combine
+         */
+        Module_Forward_Separate = 16,
+        Module_Forward_Combine = 17,
+    };
+    /**
+     * @brief The API shoud be called before create session.
+     * @param mode      session mode
+     */
+    void setSessionMode(SessionMode mode);
+
+    /**
+     * @brief The API shoud be called before create session.
+     * If the cache exist, try to load cache from file.
+     * After createSession, try to save cache to file.
+     * @param cacheFile      cache file name
+     * @param keySize        depercerate, for future use.
+     */
+    void setCacheFile(const char* cacheFile, size_t keySize = 128);
+
+    /**
+     * @brief The API shoud be called before create session.
+     * @param file      external data file name
+     * @param keySize        depercerate, for future use.
+     */
+    void setExternalFile(const char* file, size_t flag = 128);
+    /**
+     * @brief The API shoud be called after last resize session.
+     * If resize session generate new cache info, try to rewrite cache file.
+     * If resize session do not generate any new cache info, just do nothing.
+     * @param session    given session
+     * @param flag   Protected param, not used now
+     */
+
+    ErrorCode updateCacheFile(Session *session, int flag = 0);
+
+    enum HintMode {
+        // Max Op number for async tuning
+        MAX_TUNING_NUMBER = 0,
+        // Strictly check model file or not, default 1. if set 0, will not check model file valid/invalid
+        STRICT_CHECK_MODEL = 1,
+        MEM_ALLOCATOR_TYPE = 2,
+        // Winograd unit candidates count, default 3. if set 0, will use less unit candidates for less memory at the expense of performance.
+        WINOGRAD_MEMORY_LEVEL = 3,
+
+        // Geometry Compute option, default is 0xFFFF
+        GEOMETRY_COMPUTE_MASK = 4,
+
+        // default 0
+        // 1: For general convolution, use one scale&zeropoint to quant.
+        // 2: use block-quant for input data.
+        DYNAMIC_QUANT_OPTIONS = 5,
+
+        // For Mobile CPU with big-litter core, set decrease rate to let MNN divide task differential by CPU's performance
+        // 0-100, 50 means litter core has 50% capacity of large core
+        // Default is 50
+        CPU_LITTLECORE_DECREASE_RATE = 6,
+
+        // attentionOption % 8:
+        // 0: Do not quantize
+        // 1: Q,K: Int8, V: Float
+        // 2: Q,K,V: Int8
+
+        // attentionOption / 8:
+        // 0: don't use flash attention
+        // 1: use flash attention
+        ATTENTION_OPTION = 7,
+
+        // size limit of kvcache in memory (for a single layer)
+        // if the size of kvcache exceeds the limit, it will be moved to disk
+        KVCACHE_SIZE_LIMIT = 8,
+        // Op encoder number for commit
+        OP_ENCODER_NUMBER_FOR_COMMIT = 9,
+
+        // KVCache Info
+        KVCACHE_INFO = 10,
+        // mmap allocate file size, KB
+        MMAP_FILE_SIZE = 11,
+        USE_CACHED_MMAP = 12,
+
+        // Multi-Thread Load module, default is 0 (don't use other Thread)
+        INIT_THREAD_NUMBER = 13,
+
+        // Used CPU ids
+        CPU_CORE_IDS = 14,
+
+        // set CPU threads to use when supports Arm sme2
+        CPU_SME2_INSTRUCTIONS = 15,
+
+        // Enable KleidiAI
+        CPU_ENABLE_KLEIDIAI = 16,
+
+        // Set CPU SME2 NEON division ratio, default is 41
+        CPU_SME2_NEON_DIVISION_RATIO = 17,
+    };
+
+    enum ExternalPathType {
+        // Path of the kvcache directory
+        EXTERNAL_PATH_KVCACHE_DIR = 0,
+
+        // Mid Buffer Cache File
+        EXTERNAL_FEATUREMAP_DIR = 1,
+
+        // Weight Buffer Cache File
+        EXTERNAL_WEIGHT_DIR = 2,
+
+        // Path of the NPU Model directory
+        EXTERNAL_NPU_FILE_DIR = 3,
+
+        // Path of the kvcache directory
+        EXTERNAL_PATH_PREFIXCACHE_DIR = 4,
+
+        // Other types ...
+    };
+
+    enum GeometryComputeMask {
+        // Support Region Fuse
+        GEOMETRCOMPUTEMASK_FUSEREGION = 1 << 0,
+
+        // Support Region Fuse to input with multi-region, eg: pad + concat
+        GEOMETRCOMPUTEMASK_FUSEREGION_MULTI = 1 << 1,
+
+        // Use loop instead of raster + compute if possible
+        GEOMETRCOMPUTEMASK_USELOOP = 1 << 2,
+
+        // Support Geometry Cache, if shape changed, will try recompute, and then run compute if failed
+        GEOMETRCOMPUTEMASK_OPENCACHE = 1 << 3,
+
+        // Full option open mask, for example, if want to close useloop, can set mask as (GEOMETRCOMPUTEMASK_ALL - GEOMETRCOMPUTEMASK_USELOOP)
+        GEOMETRCOMPUTEMASK_ALL = 0xFFFF,
+    };
+
+    /**
+     * @brief The API shoud be called before create session.
+     * @param hint      Hint type
+     * @param value     Hint value
+     * @param size      Hint value size(when use a ptr)
+     */
+    void setSessionHint(HintMode hint, int value);
+    void setSessionHint(HintMode hint, int* value, size_t size);
 public:
+    /**
+     * @brief create runtimeInfo separately with schedule config.
+     * @param configs session schedule configs.
+     */
+    static RuntimeInfo createRuntime(const std::vector<ScheduleConfig>& configs);
+
     /**
      * @brief create session with schedule config. created session will be managed in net.
      * @param config session schedule config.
@@ -117,11 +323,26 @@ public:
     Session* createSession(const ScheduleConfig& config);
 
     /**
+     * @brief create session with schedule config and user-specified runtime.
+     * @param config session schedule config, runtime runtimeInfo used by the created session.
+     * @return created session if success, NULL otherwise.
+     */
+    Session* createSession(const ScheduleConfig& config, const RuntimeInfo& runtime);
+
+    /**
      * @brief create multi-path session with schedule configs. created session will be managed in net.
      * @param configs session schedule configs.
      * @return created session if success, NULL otherwise.
      */
     Session* createMultiPathSession(const std::vector<ScheduleConfig>& configs);
+
+    /**
+     * @brief create multi-path session with schedule configs and user-specified runtime.
+              created session will be managed in net.
+     * @param configs session schedule configs.
+     * @return created session if success, NULL otherwise.
+     */
+    Session* createMultiPathSession(const std::vector<ScheduleConfig>& configs, const RuntimeInfo& runtime);
 
     /**
      * @brief release session.
@@ -138,6 +359,15 @@ public:
     void resizeSession(Session* session);
 
     /**
+     * @brief call this function to get tensors ready. output tensor buffer (host or deviceId) should be retrieved
+     *        after resize of any input tensor.
+     * @param session given session.
+     * @param needRelloc, 1 means need realloc.
+     */
+    void resizeSession(Session* session, int needRelloc);
+
+
+    /**
      * @brief call this function if don't need resize or create session any more, it will save a few memory that equal
      * to the size of model buffer
      */
@@ -145,13 +375,20 @@ public:
 
     /**
      * @brief Get the model buffer for user to save
-     * @return std::make_pair(modleBuffer, modelSize).
+     * @return std::make_pair(modelBuffer, modelSize).
      * @example:
      * std::ofstream output("trainResult.alinn")
      * auto buffer = net->getModelBuffer();
      * output.write((const char*)buffer.first, buffer.second);
      */
     std::pair<const void*, size_t> getModelBuffer() const;
+
+    /**
+     * @brief Get the model's version info.
+     * @return const char* of model's version info like "2.0.0";
+     * If model is not loaded or model no version info, return "version info not found".
+     */
+    const char* getModelVersion() const;
 
     /**
      * @brief update Session's Tensor to model's Const Op
@@ -204,16 +441,47 @@ public:
      */
     Tensor* getSessionOutput(const Session* session, const char* name);
 
+    enum SessionInfoCode {
+        /** memory session used in MB, float* */
+        MEMORY = 0,
+
+        /** float operation needed in session in M, float* */
+        FLOPS = 1,
+
+        /** Backends in session in M, int*, length >= 1 + number of configs when create session */
+        BACKENDS = 2,
+
+        /** Resize Info, int* , the mean different from API
+         Interpreter::getSessionInfo: 0: ready to execute, 1: need malloc, 2: need resize
+         RuntimeManager::getInfo: 0: no resize, 1: re-malloc, 2: resize
+         */
+        RESIZE_STATUS = 3,
+
+        /** Mode / NumberThread, int* */
+        THREAD_NUMBER = 4,
+
+        ALL
+    };
+
     /**
-     * @brief get all input tensors.
+     * @brief get session info
      * @param session   given session.
-     * @return all input tensors mapped with name.
+     * @param code      given info code.
+     * @param ptr     given info ptr, see SessionInfoCode for detail
+     * @return true if support the code, false otherwise.
      */
-    const std::map<std::string, Tensor*>& getSessionOutputAll(const Session* session) const;
+    bool getSessionInfo(const Session* session, SessionInfoCode code, void* ptr);
+
     /**
      * @brief get all output tensors.
      * @param session   given session.
      * @return all output tensors mapped with name.
+     */
+    const std::map<std::string, Tensor*>& getSessionOutputAll(const Session* session) const;
+    /**
+     * @brief get all input tensors.
+     * @param session   given session.
+     * @return all input tensors mapped with name.
      */
     const std::map<std::string, Tensor*>& getSessionInputAll(const Session* session) const;
 
@@ -248,8 +516,14 @@ public:
      */
     const char* bizCode() const;
 
+    /**
+     * @brief get model UUID
+     * @return Model UUID.
+     */
+    const char* uuid() const;
+
 private:
-    static Interpreter* createFromBufferInternal(Content* net);
+    static Interpreter* createFromBufferInternal(Content* net, bool enforceAuth);
 
     Content* mNet = nullptr;
     Interpreter(Content* net);
@@ -258,6 +532,10 @@ private:
     Interpreter(const Interpreter&&) = delete;
     Interpreter& operator=(const Interpreter&) = delete;
     Interpreter& operator=(const Interpreter&&) = delete;
+    void waitSessionFinish(const Session* session) const;
+#ifdef MNN_INTERNAL_ENABLED
+    void logForRunSession(const Session* session, float time, const char* api) const;
+#endif
 };
 } // namespace MNN
 

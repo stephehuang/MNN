@@ -1,39 +1,33 @@
 
-file(GLOB MNN_ARM82_SRCS "${CMAKE_CURRENT_LIST_DIR}/*.cpp")
+file(GLOB MNN_ARM82_SRCS "${CMAKE_CURRENT_LIST_DIR}/*.cpp" "${CMAKE_CURRENT_LIST_DIR}/compute/*.cpp")
 
-set(COMPILE_ARM64 OFF)
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "^aarch64" OR IOS_ARCH STREQUAL "arm64")
-    set(COMPILE_ARM64 ON)
-endif()
-
-if(COMPILE_ARM64)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^armv7" OR ARCHS MATCHES "^armv7(;armv7s)?")
+    file(GLOB MNN_ARM82_SRCS_ASM "${CMAKE_CURRENT_LIST_DIR}/asm/arm32/*")
+    add_library(MNN_Arm82 OBJECT ${MNN_ARM82_SRCS} ${MNN_ARM82_SRCS_ASM})
+    target_compile_options(MNN_Arm82 PRIVATE -march=armv8.2-a+fp16 -mfpu=neon-fp-armv8 -mfloat-abi=softfp -DENABLE_ARMV82)
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^aarch64" OR ARCHS STREQUAL "arm64" OR ARCHS STREQUAL "ARM64")
     file(GLOB MNN_ARM82_SRCS_ASM "${CMAKE_CURRENT_LIST_DIR}/asm/arm64/*")
-else()
-    set(MNN_ARM82_SRCS_ASM "")
-endif()
-
-IF(MNN_SEP_BUILD)
-    if (MNN_BUILD_FOR_ANDROID_COMMAND)
-        set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "../../../")
+    if (MNN_LOW_MEMORY)
+        file(GLOB MNN_ARM82_SRCS_ASM ${MNN_ARM82_SRCS_ASM} ${CMAKE_CURRENT_LIST_DIR}/asm/arm64/low_memory/*)
     endif()
-    add_library(
-        MNN_Arm82
-        SHARED
-        ${MNN_ARM82_SRCS}
-        ${MNN_ARM82_SRCS_ASM}
-        )
-    target_link_libraries(MNN_Arm82 MNN)
-ELSE()
-    add_library(
-        MNN_Arm82
-        OBJECT
-        ${MNN_ARM82_SRCS}
-        ${MNN_ARM82_SRCS_ASM}
-        )
-ENDIF()
+    if (MNN_SME2)
+        file(GLOB MNN_SME2_SRCS_ASM_FP16 ${MNN_SME2_SRCS_ASM_FP16} ${CMAKE_CURRENT_LIST_DIR}/asm/arm64/sme2_asm/*)
+        #set_source_files_properties(${MNN_SME2_SRCS_ASM_FP16} PROPERTIES COMPILE_OPTIONS "-fno-tree-vectorize;-march=armv8.6-a+sve+sve2+sme+sme2+fp16")
+        set_source_files_properties(${MNN_SME2_SRCS_ASM_FP16} PROPERTIES COMPILE_OPTIONS "-fno-tree-vectorize;-march=armv8.2-a+fp16")
+    endif()
+    set_source_files_properties(${MNN_ARM82_SRCS} PROPERTIES COMPILE_OPTIONS "-march=armv8.2-a+fp16")
+    set_source_files_properties(${MNN_ARM82_SRCS_ASM} PROPERTIES COMPILE_OPTIONS "-march=armv8.2-a+fp16")
 
-if(COMPILE_ARM64)
-    target_compile_options(MNN_Arm82 PRIVATE -march=armv8.2-a+fp16)
+    add_library(MNN_Arm82 OBJECT ${MNN_ARM82_SRCS} ${MNN_ARM82_SRCS_ASM} ${MNN_SME2_SRCS_ASM_FP16})
+    if (MNN_LOW_MEMORY)
+        target_compile_options(MNN_Arm82 PRIVATE -DMNN_LOW_MEMORY)
+    endif()
+
+    target_compile_options(MNN_Arm82 PRIVATE -march=armv8.2-a+fp16 -DENABLE_ARMV82)
+else()
+# Building fat binary requires multiple separate builds and lipo-by-hand under CMake's design
 endif()
 
+target_include_directories(MNN_Arm82 PRIVATE ${CMAKE_CURRENT_LIST_DIR})
+target_include_directories(MNN_Arm82 PRIVATE ${CMAKE_CURRENT_LIST_DIR}/compute/)
 target_include_directories(MNN_Arm82 PRIVATE ${CMAKE_CURRENT_LIST_DIR}/asm/)

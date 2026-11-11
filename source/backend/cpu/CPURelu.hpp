@@ -11,28 +11,37 @@
 
 #include "core/AutoStorage.h"
 #include "core/Execution.hpp"
+#include "core/TensorUtils.hpp"
+#include "backend/cpu/compute/Int8FunctionsOpt.h"
 
 namespace MNN {
 class CPURelu : public Execution {
 public:
-    CPURelu(Backend *b, float slope) : Execution(b), mSlope(slope) {
-        // nothing to do
-    }
+    CPURelu(Backend *b, float slope);
     virtual ~CPURelu() = default;
     virtual ErrorCode onExecute(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override;
-
+    virtual ErrorCode onResize(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override;
 private:
-    float mSlope;
+    AutoStorage<uint8_t> mSlope;
+    AutoStorage<uint8_t> mCacheSrc;
+    AutoStorage<uint8_t> mCacheDst;
+    int mRealSize;
 };
 
 class CPUPRelu : public Execution {
 public:
     CPUPRelu(Backend *b, const Op *op);
-    virtual ~CPUPRelu() = default;
+    virtual ~CPUPRelu();
     virtual ErrorCode onExecute(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override;
-
+    virtual ErrorCode onResize(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override;
 private:
-    AutoStorage<float> mSlope;
+    Tensor mSlope;
+    int mUseInt8 = 0;
+    std::vector<float> mQuanScalesInput;
+    std::vector<float> mQuanScalesOutput;
+    std::vector<ssize_t> mQuanZerosInput;
+    std::vector<ssize_t> mQuanZerosOutput;
+    std::shared_ptr<QuanPrePostParameters> mParams;
 };
 
 class CPURelu6 : public Execution {
@@ -46,9 +55,13 @@ public:
         };
     }
     virtual ~CPURelu6() = default;
+    virtual ErrorCode onResize(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override;
     virtual ErrorCode onExecute(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override;
 private:
     std::vector<float> mParam;
+    AutoStorage<uint8_t> mCacheSrc;
+    AutoStorage<uint8_t> mCacheDst;
+    int mRealSize;
 };
 
 } // namespace MNN

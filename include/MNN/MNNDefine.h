@@ -20,9 +20,20 @@
 #endif
 
 #ifdef MNN_USE_LOGCAT
+#if defined(__OHOS__)
+#include <hilog/log.h>
+#define MNN_ERROR(format, ...) {char logtmp[4096]; snprintf(logtmp, 4096, format, ##__VA_ARGS__); OH_LOG_Print(LOG_APP, LOG_ERROR, LOG_DOMAIN, "MNNJNI", (const char*)logtmp);}
+#define MNN_PRINT(format, ...) {char logtmp[4096]; snprintf(logtmp, 4096, format, ##__VA_ARGS__); OH_LOG_Print(LOG_APP, LOG_DEBUG, LOG_DOMAIN, "MNNJNI", (const char*)logtmp);}
+#else
 #include <android/log.h>
 #define MNN_ERROR(format, ...) __android_log_print(ANDROID_LOG_ERROR, "MNNJNI", format, ##__VA_ARGS__)
 #define MNN_PRINT(format, ...) __android_log_print(ANDROID_LOG_INFO, "MNNJNI", format, ##__VA_ARGS__)
+#endif
+#elif defined MNN_BUILD_FOR_IOS
+// on iOS, stderr prints to XCode debug area and syslog prints Console. You need both.
+#include <syslog.h>
+#define MNN_PRINT(format, ...) syslog(LOG_WARNING, format, ##__VA_ARGS__); fprintf(stderr, format, ##__VA_ARGS__)
+#define MNN_ERROR(format, ...) syslog(LOG_WARNING, format, ##__VA_ARGS__); fprintf(stderr, format, ##__VA_ARGS__)
 #else
 #define MNN_PRINT(format, ...) printf(format, ##__VA_ARGS__)
 #define MNN_ERROR(format, ...) printf(format, ##__VA_ARGS__)
@@ -38,13 +49,7 @@
         }                                                        \
     }
 #else
-#define MNN_ASSERT(x)                                            \
-    {                                                            \
-        int res = (x);                                           \
-        if (!res) {                                              \
-            MNN_ERROR("Error for %d\n", __LINE__); \
-        }                                                        \
-    }
+#define MNN_ASSERT(x)
 #endif
 
 #define FUNC_PRINT(x) MNN_PRINT(#x "=%d in %s, %d \n", x, __func__, __LINE__);
@@ -54,7 +59,6 @@
 if(!(success)){ \
 MNN_ERROR("Check failed: %s ==> %s\n", #success, #log); \
 }
-
 #if defined(_MSC_VER)
 #if defined(BUILDING_MNN_DLL)
 #define MNN_PUBLIC __declspec(dllexport)
@@ -66,5 +70,10 @@ MNN_ERROR("Check failed: %s ==> %s\n", #success, #log); \
 #else
 #define MNN_PUBLIC __attribute__((visibility("default")))
 #endif
-
+#define STR_IMP(x) #x
+#define STR(x) STR_IMP(x)
+#define MNN_VERSION_MAJOR 3
+#define MNN_VERSION_MINOR 6
+#define MNN_VERSION_PATCH 2
+#define MNN_VERSION STR(MNN_VERSION_MAJOR) "." STR(MNN_VERSION_MINOR) "." STR(MNN_VERSION_PATCH)
 #endif /* MNNDefine_h */

@@ -9,29 +9,37 @@
 #ifndef CPUDepthwiseConvInt8_hpp
 #define CPUDepthwiseConvInt8_hpp
 
-#include "backend/cpu/CPUConvolution.hpp"
-
+#include "CPUConvolution.hpp"
+#include "compute/Int8FunctionsOpt.h"
 namespace MNN {
 
 class CPUDepthwiseConvInt8 : public CPUConvolution {
 public:
-    CPUDepthwiseConvInt8(Backend *backend, const MNN::Convolution2D *convOp);
-    virtual ~CPUDepthwiseConvInt8() = default;
+    CPUDepthwiseConvInt8(Backend *backend, const Convolution2DCommon* common, std::shared_ptr<ResourceInt8> res);
+    virtual ~CPUDepthwiseConvInt8();
     virtual ErrorCode onResize(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override;
     virtual ErrorCode onExecute(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override;
-
+    virtual bool onClone(Backend* bn, const Op* op, Execution** dst) override;
 private:
     int mThreadNumber;
-    // int mPadX;
-    // int mPadY;
-    // relu or relu6
-    bool mRelu;
-    // True represent the middle accumulator if INT16, Fasle is INT32
-    bool mFastMode;
-    std::shared_ptr<Tensor> mWeightInt8;
-    std::shared_ptr<Tensor> mBiasInt32;
-    std::shared_ptr<Tensor> mScaleFloat;
-    std::function<void(int tId, const int8_t *src, int8_t *dst)> mThreadFunction;
+    int mPack = 16;
+    bool mUse3x3Kernel = false;
+    std::shared_ptr<CPUConvolution::ResourceInt8> mResource;
+    std::shared_ptr<Tensor> mInputPad;
+    std::pair<int, int> mPads;
+    std::pair<int, int> mPaddedSize;
+    std::pair<int, int> mStrides;
+    std::pair<int, int> mDilates;
+    std::pair<int, int> mKernels;
+    MutableResourceInt8 mMutableResource;
+    std::shared_ptr<Tensor> mInputTemp;
+    std::shared_ptr<Tensor> mOutputTemp;
+    std::shared_ptr<Tensor> mWeightTemp;
+    void fastDepthwiseInt8(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs);
+    std::function<void(int8_t* dst, const int8_t* src, const int8_t* weight, const QuanPostTreatParameters* parameters, size_t width,
+                       size_t src_w_step, size_t fw, size_t fh, size_t dilateX_step, size_t dilateY_step, int8_t* idxOrder)> mThreadFunction;
+    std::vector<int8_t> mOrder;
+    std::vector<int32_t> mBiasExtend;
 };
 
 } // namespace MNN

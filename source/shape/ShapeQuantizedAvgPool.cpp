@@ -5,10 +5,10 @@
 //  Created by MNN on 2019/01/10.
 //  Copyright © 2018, Alibaba Group Holding Limited
 //
-#ifdef MNN_SUPPORT_TFLITE_QUAN
 #include <math.h>
+#include "shape/SizeComputer.hpp"
+#ifdef MNN_SUPPORT_DEPRECATED_OP
 #include "core/Macro.h"
-#include "core/SizeComputer.hpp"
 
 namespace MNN {
 class QuantizedAvgPoolComputer : public SizeComputer {
@@ -39,19 +39,25 @@ class QuantizedAvgPoolComputer : public SizeComputer {
         // output：NHWC MNN: nchw
         auto& outputBuffer         = outputs[0]->buffer();
         outputBuffer.dimensions    = input->buffer().dimensions;
+        outputs[0]->setType(DataType_DT_UINT8);
+        auto format = TensorUtils::getDescribe(inputs[0])->dimensionFormat;
         outputBuffer.dim[0].extent = input->buffer().dim[0].extent;
-        
         outputBuffer.dim[2].extent = output_height;
         outputBuffer.dim[3].extent = output_width;
         outputBuffer.dim[1].extent = input->buffer().dim[1].extent;
-        
-        outputs[0]->setType(DataType_DT_UINT8);
-        TensorUtils::getDescribe(outputs[0])->dimensionFormat = TensorUtils::getDescribe(inputs[0])->dimensionFormat;
+        if (format == MNN_DATA_FORMAT_NHWC) {
+            outputBuffer.dim[1].extent = output_height;
+            outputBuffer.dim[2].extent = output_width;
+            outputBuffer.dim[3].extent = input->channel();
+        }
+        TensorUtils::getDescribe(outputs[0])->dimensionFormat = format;
 
         return true;
     }
 };
 
-REGISTER_SHAPE(QuantizedAvgPoolComputer, OpType_QuantizedAvgPool);
 } // namespace MNN
 #endif
+namespace MNN {
+REGISTER_SHAPE_OLD(QuantizedAvgPoolComputer, OpType_QuantizedAvgPool);
+};

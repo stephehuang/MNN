@@ -6,15 +6,14 @@
 //  Copyright © 2018, Alibaba Group Holding Limited
 //
 
+#include "shape/SizeComputer.hpp"
 #include "core/Macro.h"
-#include "core/SizeComputer.hpp"
 #include "core/TensorUtils.hpp"
 
 namespace MNN {
 class UnSqueezeSizeComputer : public SizeComputer {
     virtual bool onComputeSize(const MNN::Op* op, const std::vector<Tensor*>& inputs,
                                const std::vector<Tensor*>& outputs) const override {
-        MNN_ASSERT(1 == inputs.size());
         MNN_ASSERT(1 == outputs.size());
 
         const int* squeezeDim = nullptr;
@@ -22,21 +21,32 @@ class UnSqueezeSizeComputer : public SizeComputer {
         if (nullptr != op->main_as_SqueezeParam()->squeezeDims()) {
             squeezeDim     = op->main_as_SqueezeParam()->squeezeDims()->data();
             squeezeDimSize = op->main_as_SqueezeParam()->squeezeDims()->size();
+        } else if (inputs.size() > 1) {
+            squeezeDim     = inputs[1]->host<int>();
+            squeezeDimSize = inputs[1]->elementSize();
         }
-
-        std::set<int> dimSet;
-        for (int i = 0; i < squeezeDimSize; i++) {
-            dimSet.insert(squeezeDim[i]);
-        }
-
         auto& ob = outputs[0]->buffer();
-        auto ib  = inputs[0]->buffer();
-
+        auto& ib  = inputs[0]->buffer();
         ob.dimensions = ib.dimensions + squeezeDimSize;
+        if (ob.dimensions > MNN_MAX_TENSOR_DIM || ob.dimensions < 0) {
+            return false;
+        }
+        uint32_t mask[MNN_MAX_TENSOR_DIM];
+        ::memset(mask, 0, sizeof(mask));
+        for (int i = 0; i < squeezeDimSize; i++) {
+            int axis = squeezeDim[i];
+            if (axis < 0) {
+                axis += ob.dimensions;
+            }
+            if (axis < 0 || axis >= ob.dimensions) {
+                return false;
+            }
+            mask[axis] = 1;
+        }
         int oDim      = 0;
         for (int i = 0; i < ob.dimensions; i++) {
             ob.dim[i].extent = 1;
-            if (dimSet.find(i) == dimSet.end()) {
+            if (mask[i] == 0) {
                 ob.dim[i].extent = ib.dim[oDim].extent;
                 oDim++;
             }
@@ -50,7 +60,6 @@ class UnSqueezeSizeComputer : public SizeComputer {
 class SqueezeSizeComputer : public SizeComputer {
     virtual bool onComputeSize(const MNN::Op* op, const std::vector<Tensor*>& inputs,
                                const std::vector<Tensor*>& outputs) const override {
-        MNN_ASSERT(1 == inputs.size());
         MNN_ASSERT(1 == outputs.size());
 
         const int* squeezeDim = nullptr;
@@ -58,31 +67,48 @@ class SqueezeSizeComputer : public SizeComputer {
         if (nullptr != op->main_as_SqueezeParam()->squeezeDims()) {
             squeezeDim     = op->main_as_SqueezeParam()->squeezeDims()->data();
             squeezeDimSize = op->main_as_SqueezeParam()->squeezeDims()->size();
+        } else if (inputs.size() > 1) {
+            squeezeDim     = inputs[1]->host<int>();
+            squeezeDimSize = inputs[1]->elementSize();
         }
-
-        std::set<int> dimSet;
-        for (int i = 0; i < squeezeDimSize; i++) {
-            dimSet.insert(squeezeDim[i]);
-        }
-
+        uint32_t mask[MNN_MAX_TENSOR_DIM];
+        ::memset(mask, 0, sizeof(mask));
         auto& ob = outputs[0]->buffer();
-        auto ib  = inputs[0]->buffer();
-
+        auto& ib = inputs[0]->buffer();
+        for (int i = 0; i < squeezeDimSize; i++) {
+            int axis = squeezeDim[i];
+            if (axis < 0) {
+                axis += ib.dimensions;
+            }
+            if (axis < 0 || axis >= ib.dimensions) {
+                return false;
+            }
+            if (1 != ib.dim[axis].extent) {
+                MNN_ERROR("Cannot Squeeze dim[%d], 1 is expected, %d is got. input shape:", axis, ib.dim[axis].extent);
+                inputs[0]->printShape();
+                return false;
+            }
+            mask[axis] = 1;
+        }
         if (squeezeDimSize == 0) {
             for (int i = 0; i < ib.dimensions; ++i) {
                 if (ib.dim[i].extent == 1) {
-                    dimSet.insert(i);
-                    ++squeezeDimSize;
+                    mask[i] = 1;
                 }
             }
         }
+        // Count actual unique squeezed dimensions from mask
+        int actualSqueeze = 0;
+        for (int i = 0; i < ib.dimensions; i++) {
+            if (mask[i]) {
+                actualSqueeze++;
+            }
+        }
 
-        MNN_ASSERT(squeezeDimSize < ib.dimensions);
-
-        ob.dimensions = ib.dimensions - squeezeDimSize;
+        ob.dimensions = ib.dimensions - actualSqueeze;
         int oDim      = 0;
         for (int i = 0; i < ib.dimensions; i++) {
-            if (dimSet.find(i) == dimSet.end()) {
+            if (mask[i] == 0) {
                 ob.dim[oDim].extent = ib.dim[i].extent;
                 oDim++;
             }

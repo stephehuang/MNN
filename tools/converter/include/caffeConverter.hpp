@@ -9,6 +9,7 @@
 #ifndef CAFFECONVERTER_HPP
 #define CAFFECONVERTER_HPP
 
+#include <MNN/MNNDefine.h>
 #include "MNN_generated.h"
 
 /**

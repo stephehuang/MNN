@@ -18,8 +18,7 @@
 namespace MNN {
 class VulkanDevice : public NonCopyable {
 public:
-    explicit VulkanDevice(std::shared_ptr<VulkanInstance> instance,
-                          const std::vector<const char*>& device_extensions = {});
+    explicit VulkanDevice(std::shared_ptr<VulkanInstance> instance);
     explicit VulkanDevice(std::shared_ptr<VulkanInstance> instance, VkPhysicalDevice physicalDevice, VkDevice device,
                           uint32_t queueFamilyIndex, VkQueue queue);
     virtual ~VulkanDevice();
@@ -48,8 +47,6 @@ public:
                                            const uint32_t memoryRangeCount = 1) const;
     const VkResult invalidateMappedMemoryRanges(const VkMappedMemoryRange* memoryRanges,
                                                 const uint32_t memoryRangeCount = 1) const;
-
-    const void getPhysicalDeviceMemoryProperties(VkPhysicalDeviceMemoryProperties& memoryProperties) const;
 
     // VkCommand*
     const VkResult createCommandPool(
@@ -80,7 +77,7 @@ public:
 
     // VkImage/VkSampler
     const VkResult createImage(VkImage& image, const VkImageType imageType, const uint32_t width, const uint32_t height,
-                               const uint32_t depth, const VkFormat format,
+                               const uint32_t depth, const VkFormat format, VkImageUsageFlags usage,
                                const VkAllocationCallbacks* allocator = nullptr) const;
     const void destroyImage(const VkImage& image, const VkAllocationCallbacks* allocator = nullptr) const;
 
@@ -135,14 +132,9 @@ public:
     const void destroyPipeline(const VkPipeline& pipeline, const VkAllocationCallbacks* allocator = nullptr) const;
 
     const VkResult createDescriptorPool(VkDescriptorPool& descriptorPool, const uint32_t poolSizeCount,
-                                        const VkDescriptorPoolSize* pPoolSizes,
+                                        const VkDescriptorPoolSize* pPoolSizes, const uint32_t maxSets = 1,
                                         const VkAllocationCallbacks* allocator = nullptr) const;
 
-    const VkResult allocateDescriptorSets(VkDescriptorSet* pDescriptorSets,
-                                          const VkDescriptorSetAllocateInfo* allocateInfo) const;
-
-    const VkResult allocateDescriptorSet(VkDescriptorSet& pDescriptorSet,
-                                         const VkDescriptorSetAllocateInfo& allocateInfo) const;
     const VkResult allocateDescriptorSet(VkDescriptorSet& pDescriptorSet, const VkDescriptorPool& descPool,
                                          const VkDescriptorSetLayout& setLayout) const;
 
@@ -155,14 +147,64 @@ public:
     const VkPhysicalDeviceProperties& proty() const {
         return mDeviceProty;
     }
+    const VkPhysicalDeviceMemoryProperties& memProty() const {
+        return mMemoryProty;
+    }
 
     const bool success() const {
         return (VK_NULL_HANDLE != mDevice);
     }
+    
+    const float getTimestampPeriod() const {
+        return mDeviceProty.limits.timestampPeriod;
+    }
+    
+    const int getMaxComputeWorkGroupInvocations() const {
+        return mDeviceProty.limits.maxComputeWorkGroupInvocations;
+    }
+    const int32_t getLocalMemorySize() const {
+        return mLocalMemorySize;
+    }
+    
+    const void getMaxComputeWorkGroupSize(std::vector<int> &groups) const{
+        if(groups.size() == 3){
+            groups[0] = mDeviceProty.limits.maxComputeWorkGroupSize[0];
+            groups[1] = mDeviceProty.limits.maxComputeWorkGroupSize[1];
+            groups[2] = mDeviceProty.limits.maxComputeWorkGroupSize[2];
+        }
+    }
+
+    struct SubgroupInfo {
+        uint32_t size = 0;
+        VkShaderStageFlags stages = 0;
+        VkSubgroupFeatureFlags ops = 0;
+        VkBool32 quadAllStages = VK_FALSE;
+    };
+
+    const SubgroupInfo& getSubgroupInfo() const {
+        return mSubgroupInfo;
+    }
+
+    uint32_t getSubgroupSize() const {
+        return mSubgroupInfo.size;
+    }
+
+    bool getFP16Support() const {
+        return mFP16Info.supportFP16;
+    }
+
+    bool getInt8Support() const {
+        return mInt8Info.supportInt8;
+    }
 
 private:
-    const VkResult enumerateDeviceExtensionProperties(const VkPhysicalDevice& dev,
-                                                      std::vector<VkExtensionProperties>& exts_props) const;
+    // Set mFP16Info
+    void checkFP16(const std::vector<VkExtensionProperties>& availableExts);
+    // Set mCoopMatInfo
+    void checkCoopMat(const std::vector<VkExtensionProperties>& availableExts);
+    // Set mInt8Info
+    void checkInt8(const std::vector<VkExtensionProperties>& availableExts);
+
 
 private:
     bool mOwner;
@@ -172,6 +214,56 @@ private:
     VkDevice mDevice;
     VkPhysicalDeviceProperties mDeviceProty;
     VkQueue mQueue;
+    VkPhysicalDeviceMemoryProperties mMemoryProty;
+    SubgroupInfo mSubgroupInfo{};
+    uint32_t mLocalMemorySize = 0;
+
+// FP16 related
+private:
+struct FP16Info {
+    bool supportFP16{false};
+    bool FP16FromExtension{false};
+    VkPhysicalDeviceVulkan11Features enabledVulkan11Features{};
+    VkPhysicalDeviceVulkan12Features enabledVulkan12Features{};
+    VkPhysicalDeviceShaderFloat16Int8Features enabledShaderFloat16Int8Features{};
+    VkPhysicalDevice16BitStorageFeatures enabled16BitStorageFeatures{};
+};
+    FP16Info mFP16Info{};
+
+// CoopMat related
+public:
+    struct CoopMatInfo {
+        bool supportCoopMat{false};
+        VkPhysicalDeviceCooperativeMatrixFeaturesKHR enabledCoopMatFeatures{};
+        std::vector<std::vector<uint32_t>> fp32CoopMatShape;
+        std::vector<std::vector<uint32_t>> fp16CoopMatShape;
+        std::vector<uint32_t> selectedFP32CoopMatShape; // {M, N, K}
+        std::vector<uint32_t> selectedFP16CoopMatShape; // {M, N, K}
+        // S8S8->S32 cooperative matrix (used by W8A8 conv1x1 prefill path)
+        bool supportS8S8S32{false};
+        std::vector<std::vector<uint32_t>> s8CoopMatShape;
+        std::vector<uint32_t> selectedS8CoopMatShape; // {M, N, K}
+    };
+private:
+    CoopMatInfo mCoopMatInfo{};
+public:
+    CoopMatInfo getCoopMatInfo() const {
+        return mCoopMatInfo;
+    }
+
+// Int8 storage / arithmetic related (independent of FP16 path)
+private:
+    struct Int8Info {
+        bool supportInt8{false};
+        // Reuses the same VkPhysicalDeviceShaderFloat16Int8Features struct
+        // family as FP16, but only the shaderInt8 bit is configured here so
+        // the FP16 path remains unaffected.
+        VkPhysicalDeviceShaderFloat16Int8Features enabledShaderInt8Features{};
+        VkPhysicalDevice8BitStorageFeatures enabled8BitStorageFeatures{};
+        bool int8FromExtension{false};
+        VkPhysicalDeviceVulkan12Features enabledVulkan12Int8Features{};
+    };
+    Int8Info mInt8Info{};
 };
 } // namespace MNN
 #endif /* VulkanDevice_hpp */

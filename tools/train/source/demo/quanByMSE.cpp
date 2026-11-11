@@ -15,7 +15,7 @@
 #include "DemoUnit.hpp"
 #include "NN.hpp"
 #include "SGD.hpp"
-#include "PipelineModule.hpp"
+#include "module/PipelineModule.hpp"
 #define MNN_OPEN_TIME_TRACE
 #include <MNN/AutoTime.hpp>
 #include <functional>
@@ -231,11 +231,10 @@ static void _test(std::shared_ptr<Module> origin, std::shared_ptr<Module> optmiz
     }
 }
 
-static void _train(std::shared_ptr<Module> origin, std::shared_ptr<Module> optmized, float basicRate, std::string inputName, std::vector<std::string> outputnames, std::string blockName) {
+static void _train(std::shared_ptr<Module> origin, std::shared_ptr<Module> optmized, float basicRate, std::string inputName, std::vector<std::string> outputnames, const std::vector<std::string> blockName) {
     auto dataset = ImageNoLabelDataset::create(gImagePath, &gConfig);
-    std::shared_ptr<SGD> sgd(new SGD);
+    std::shared_ptr<SGD> sgd(new SGD(optmized));
     sgd->setGradBlockName(blockName);
-    sgd->append(optmized->parameters());
     sgd->setMomentum(1.0f);
     // sgd->setMomentum2(0.99f);
     sgd->setWeightDecay(0.0005f);
@@ -343,12 +342,14 @@ public:
             is >> basicRate;
         }
         FUNC_PRINT(bits);
-        std::string blockName;
+        std::vector<std::string> blockName;
         if (argc > 5) {
             std::istringstream is(argv[5]);
-            is >> blockName;
+            std::string s;
+            is >> s;
+            blockName.push_back(s);
         }
-        FUNC_PRINT_ALL(blockName.c_str(), s);
+        FUNC_PRINT_ALL(blockName[0].c_str(), s);
         auto inputOutputs = Variable::getInputAndOutput(varMap);
         auto inputs       = Variable::mapToSequence(inputOutputs.first);
         MNN_ASSERT(inputs.size() == 1);
@@ -383,9 +384,9 @@ public:
             BackendConfig config;
             exe->setGlobalExecutorConfig(MNN_FORWARD_CPU, config, 2);
         }
-        std::shared_ptr<Module> model(PipelineModule::extract(inputs, newOutputs, true));
-        PipelineModule::turnQuantize(model.get(), bits, gFeatureScale, gMethod);
-        std::shared_ptr<Module> originModel(PipelineModule::extract(inputs, newOutputs, false));
+        std::shared_ptr<Module> model(NN::extract(inputs, newOutputs, true));
+        NN::turnQuantize(model.get(), bits, gFeatureScale, gMethod);
+        std::shared_ptr<Module> originModel(NN::extract(inputs, newOutputs, false));
 
         _train(originModel, model, basicRate, inputName, outputNames, blockName);
         return 0;
@@ -433,7 +434,7 @@ public:
                 newOutputs.emplace_back(outputs[i]);
                 outputNames.emplace_back(outputs[i]->name());
             }
-            model0.reset(PipelineModule::extract(inputs, newOutputs, false));
+            model0.reset(NN::extract(inputs, newOutputs, false));
         }
         {
             auto varMap      = Variable::loadMap(argv[2]);
@@ -462,7 +463,7 @@ public:
                 newOutputs.emplace_back(outputs[i]);
                 outputNames.emplace_back(outputs[i]->name());
             }
-            model1.reset(PipelineModule::extract(inputs, newOutputs, false));
+            model1.reset(NN::extract(inputs, newOutputs, false));
         }
         _test(model0, model1);
         return 0;

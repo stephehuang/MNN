@@ -19,7 +19,10 @@ namespace Train {
 
 class MNN_PUBLIC SGD : public ParameterOptimizer {
 public:
+    SGD(std::shared_ptr<Express::Module> module);
+    virtual ~ SGD() = default;
     virtual std::map<Express::VARP, Express::VARP> onGetNextParameter(Express::VARP loss) override;
+    virtual std::pair<std::vector<Express::VARP>, std::vector<Express::VARP>>  onMakeParameterUpdateGraphByGrad(const std::vector<ParameterOptGrad>& parameterGrads) override;
 
     Express::VARP regularizeParameters(Express::VARP param, Express::VARP grad);
 
@@ -41,12 +44,8 @@ public:
 
     float currentLearningRate();
 
-    virtual void onAppend(Express::VARP parameters) override;
-
-    virtual void onRemove(Express::VARP parameters) override;
-
-    void setGradBlockName(std::string block) {
-        mGradBlockExprName = std::move(block);
+    void setGradBlockName(std::vector<std::string> block) {
+        mGradBlockExprName = block;
     }
 
 protected:
@@ -59,7 +58,7 @@ protected:
     // For Cache
     const Express::Expr* mLoss = nullptr;
     int mLossFromIndex         = 0;
-    std::string mGradBlockExprName;
+    std::vector<std::string> mGradBlockExprName;
 };
 
 } // namespace Train

@@ -6,10 +6,15 @@
 //  Copyright © 2018, Alibaba Group Holding Limited
 //
 
-#include "backend/vulkan/component/VulkanMemoryPool.hpp"
+#include "VulkanMemoryPool.hpp"
 namespace MNN {
 VulkanMemory::VulkanMemory(const VulkanDevice& dev, const VkMemoryAllocateInfo& info) : mDevice(dev) {
-    CALL_VK(mDevice.allocMemory(mMemory, info));
+    mMemory = VK_NULL_HANDLE;
+    auto ret = mDevice.allocMemory(mMemory, info);
+    if (ret != VK_SUCCESS) {
+        MNN_ERROR("Vulkan allocMemory failed, result=%d, size=%zu\n", ret, info.allocationSize);
+        return;
+    }
     mTypeIndex = info.memoryTypeIndex;
     mSize      = info.allocationSize;
 }
@@ -17,22 +22,77 @@ VulkanMemory::~VulkanMemory() {
     mDevice.freeMemory(mMemory);
 }
 
+class VulkanAllocator : public BufferAllocator::Allocator {
+public:
+    VulkanAllocator(const VulkanDevice& device, int index) : mDevice(device), mIndex(index) {
+        // Do nothing
+    }
+    virtual ~ VulkanAllocator() {
+        // Do nothing
+    }
+    virtual MemChunk onAlloc(size_t size, size_t align) override {
+        VkMemoryAllocateInfo info;
+        info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        info.pNext = nullptr;
+        info.allocationSize = size;
+        info.memoryTypeIndex = mIndex;
+        auto mem = new VulkanMemory(mDevice, info);
+        if (mem->get() == VK_NULL_HANDLE) {
+            delete mem;
+            return MemChunk(nullptr, 0);
+        }
+        return MemChunk(mem, 0);
+    }
+    virtual void onRelease(MemChunk ptr) override {
+        auto p = (VulkanMemory*)ptr.first;
+        delete p;
+    }
+private:
+    const VulkanDevice& mDevice;
+    int mIndex;
+};
+
 VulkanMemoryPool::VulkanMemoryPool(const VulkanDevice& dev, bool permitFp16) : mDevice(dev) {
-    mDevice.getPhysicalDeviceMemoryProperties(mPropty);
-    mFreeBuffers.resize(mPropty.memoryTypeCount);
+    mAllocators.resize(dev.memProty().memoryTypeCount);
+    for (int i=0; i<mAllocators.size(); ++i) {
+        std::shared_ptr<BufferAllocator::Allocator> allocReal(new VulkanAllocator(dev, i));
+        mAllocators[i].reset(new EagerBufferAllocator(allocReal, dev.proty().limits.nonCoherentAtomSize));
+    }
     mPermitFp16 = permitFp16;
 }
-VulkanMemoryPool::~VulkanMemoryPool() {
+VulkanMemoryPool::VulkanMemoryPool(const VulkanMemoryPool* parent) : mDevice(parent->mDevice) {
+    mPermitFp16 = parent->mPermitFp16;
+    mAllocators.resize(mDevice.memProty().memoryTypeCount);
+    for (int i=0; i<mAllocators.size(); ++i) {
+        std::shared_ptr<BufferAllocator::Allocator> allocReal = BufferAllocator::Allocator::createRecurse(parent->mAllocators[i].get());
+        mAllocators[i].reset(new EagerBufferAllocator(allocReal, mDevice.proty().limits.nonCoherentAtomSize));
+    }
 }
 
-const VulkanMemory* VulkanMemoryPool::allocMemory(const VkMemoryRequirements& requirements, VkFlags extraMask,
-                                                  bool seperate) {
+VulkanMemoryPool::~VulkanMemoryPool() {
+    clear();
+}
+
+VkBuffer VulkanMemoryPool::allocBuffer(size_t size, VkBufferUsageFlags flags, VkSharingMode shared) {
+    VkBuffer res = VK_NULL_HANDLE;
+    if (mDevice.createBuffer(res, size, flags, shared) != VK_SUCCESS) {
+        return VK_NULL_HANDLE;
+    }
+    return res;
+}
+
+void VulkanMemoryPool::returnBuffer(VkBuffer buffer, size_t size, VkBufferUsageFlags flags, VkSharingMode shared) {
+    mDevice.destroyBuffer(buffer);
+}
+
+MemChunk VulkanMemoryPool::allocMemory(const VkMemoryRequirements& requirements, VkFlags extraMask,
+                                                  bool separate) {
     uint32_t index = 0;
     auto typeBits  = requirements.memoryTypeBits;
-    for (uint32_t i = 0; i < mPropty.memoryTypeCount; i++) {
+    for (uint32_t i = 0; i < mDevice.memProty().memoryTypeCount; i++) {
         if ((typeBits & 1) == 1) {
             // Type is available, does it match user properties?
-            if ((mPropty.memoryTypes[i].propertyFlags & extraMask) == extraMask) {
+            if ((mDevice.memProty().memoryTypes[i].propertyFlags & extraMask) == extraMask) {
                 index = i;
                 break;
             }
@@ -40,55 +100,28 @@ const VulkanMemory* VulkanMemoryPool::allocMemory(const VkMemoryRequirements& re
         typeBits >>= 1;
     }
     MNN_ASSERT(index >= 0);
-    if (!seperate) {
-        auto freeIter = mFreeBuffers[index].lower_bound(requirements.size);
-        if (freeIter != mFreeBuffers[index].end()) {
-            auto result = freeIter->second;
-            mFreeBuffers[index].erase(freeIter);
-            return result;
-        }
-    }
-
-    VkMemoryAllocateInfo allocInfo{
-        /* .sType           = */ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-        /* .pNext           = */ nullptr,
-        /* .allocationSize  = */ requirements.size,
-        /* .memoryTypeIndex = */ index, // Memory type assigned in the next step
-    };
-
-    auto memory = std::make_shared<VulkanMemory>(mDevice, allocInfo);
-    mAllBuffers.insert(std::make_pair(memory.get(), memory));
-    return memory.get();
+    MNN_ASSERT(index < mAllocators.size());
+    auto mem = mAllocators[index]->alloc(requirements.size, separate, requirements.alignment);
+    MNN_ASSERT(mem.second % requirements.alignment ==0);
+    return mem;
 }
 
-void VulkanMemoryPool::returnMemory(const VulkanMemory* memory, bool clean) {
-    if (!clean) {
-        mFreeBuffers[memory->type()].insert(std::make_pair(memory->size(), memory));
-        return;
-    }
-    auto iter = mAllBuffers.find(memory);
-    if (iter != mAllBuffers.end()) {
-        mAllBuffers.erase(iter);
-    }
+void VulkanMemoryPool::returnMemory(MemChunk memory) {
+    auto mem = (VulkanMemory*)memory.first;
+    mAllocators[mem->type()]->free(memory);
     return;
 }
 
 void VulkanMemoryPool::clear() {
-    for (auto& iter : mFreeBuffers) {
-        for (auto& subIter : iter) {
-            auto eraseIter = mAllBuffers.find(subIter.second);
-            if (eraseIter != mAllBuffers.end()) {
-                mAllBuffers.erase(eraseIter);
-            }
-        }
-        iter.clear();
+    for (auto& iter : mAllocators) {
+        iter->release(false);
     }
 }
 
 float VulkanMemoryPool::computeSize() const {
     float totalSize = 0;
-    for (auto& iter : mAllBuffers) {
-        totalSize += (float)(iter.first->size());
+    for (auto& piter : mAllocators) {
+        totalSize += (float)piter->totalSize();
     }
     return totalSize / 1024.0f / 1024.0f;
 }

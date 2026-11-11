@@ -7,37 +7,70 @@
 //
 
 /**
- Ref from https://github.com/Tencent/ncnn/blob/master/src/cpu.cpp
+ Ref from:
+ https://github.com/Tencent/ncnn/blob/master/src/cpu.cpp
+ https://github.com/pytorch/cpuinfo
  */
-#ifdef __ANDROID__
+#ifdef __linux__
 #include <stdint.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#include <fcntl.h>
+#if defined(__aarch64__)
+#include <sys/auxv.h>
+#endif
+// RISC-V runtime feature detection, via riscv_hwprobe(2) (Linux 6.4+). The
+// kernel header is optional: an older sysroot can still build code that probes
+// a newer kernel, so only the struct definition is taken from it when present.
+#if defined(__riscv)
+#if defined(__has_include)
+#if __has_include(<asm/hwprobe.h>)
+#include <asm/hwprobe.h>
+#define MNN_HAS_RISCV_HWPROBE_H 1
+#endif
+#endif
 #endif
 
-#if defined(__aarch64__) && defined(ENABLE_ARMV82)
 
+#include <sys/time.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <dirent.h>
+
+// HWCAP flags
+#define CPUINFO_ARM_LINUX_FEATURE_FPHP UINT32_C(0x00000200)
+#define CPUINFO_ARM_LINUX_FEATURE_ASIMDHP UINT32_C(0x00000400)
+#define CPUINFO_ARM_LINUX_FEATURE_ASIMDDP UINT32_C(0x00100000)
+#if defined(MNN_SME2) && defined(MNN_SUPPORT_TRANSFORMER_FUSE)
+#define CPUINFO_ARM_LINUX_FEATURE_ASIMDFHM UINT32_C(0x00800000)
+#endif
+#define CPUINFO_ARM_LINUX_FEATURE_SVE UINT32_C(0x00400000)
+// HWCAP2 flags
+#define CPUINFO_ARM_LINUX_FEATURE2_SVE2 UINT32_C(0x00000002)
+// ref: https://cs.android.com/android/platform/superproject/+/master:bionic/libc/kernel/uapi/asm-arm64/asm/hwcap.h;drc=04da58f5b3bc40dbbafb4f8422aa2991479d9e1e;l=70
+#define CPUINFO_ARM_LINUX_FEATURE2_I8MM UINT32_C(0x00002000)
+#define CPUINFO_ARM_LINUX_FEATURE2_SME2 UINT64_C(0x0000002000000000)
+#endif
+
+#include <algorithm>
+#include <string>
+
+#include "core/Macro.h"
 #ifdef __ANDROID__
-#include <fcntl.h>
-#include <sys/auxv.h>
 #include <sys/system_properties.h>
-#endif // __ANDROID__
-
-#endif // ENABLE_ARMV82
+#endif
 
 #if __APPLE__
 #include "TargetConditionals.h"
+#if __aarch64__
+#include <sys/sysctl.h>
+#endif
 #if TARGET_OS_IPHONE
 #include <mach/machine.h>
-#include <sys/sysctl.h>
 #include <sys/types.h>
 #define __IOS__ 1
 #endif // TARGET_OS_IPHONE
 #endif // __APPLE__
-
-#ifdef _OPENMP
-#include <omp.h>
-#endif // _OPENMP
 
 #include <MNN/MNNDefine.h>
 #include <stdio.h>
@@ -45,121 +78,12 @@
 #include <algorithm>
 #include <vector>
 #include "backend/cpu/CPURuntime.hpp"
-
-#ifdef __ANDROID__
+#include "core/FileLoader.hpp"
 
 #define BUFFER_SIZE 1024
 
-static uint32_t getNumberOfCPU() {
-    FILE* fp = fopen("/proc/cpuinfo", "rb");
-    if (!fp) {
-        return 1;
-    }
-    uint32_t number = 0;
-    char buffer[BUFFER_SIZE];
-    while (!feof(fp)) {
-        char* str = fgets(buffer, BUFFER_SIZE, fp);
-        if (!str) {
-            break;
-        }
-        if (memcmp(buffer, "processor", 9) == 0) {
-            number++;
-        }
-    }
-    fclose(fp);
-    if (number < 1) {
-        number = 1;
-    }
-    return number;
-}
-
-static int getCPUMaxFreqKHz(int cpuID) {
-    char path[256];
-    sprintf(path, "/sys/devices/system/cpu/cpufreq/stats/cpu%d/time_in_state", cpuID);
-    FILE* fp = fopen(path, "rb");
-    if (!fp) {
-        sprintf(path, "/sys/devices/system/cpu/cpu%d/cpufreq/stats/time_in_state", cpuID);
-        fp = fopen(path, "rb");
-        if (!fp) {
-            sprintf(path, "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", cpuID);
-            fp = fopen(path, "rb");
-            if (!fp) {
-                return -1;
-            }
-            int maxfrequency = -1;
-            fscanf(fp, "%d", &maxfrequency);
-            fclose(fp);
-            return maxfrequency;
-        }
-    }
-    int maxfrequency = 0;
-    while (!feof(fp)) {
-        int frequency = 0;
-        int history   = fscanf(fp, "%d %*d", &frequency);
-        if (history != 1) {
-            break;
-        }
-        if (frequency > maxfrequency) {
-            maxfrequency = frequency;
-        }
-    }
-    fclose(fp);
-    return maxfrequency;
-}
-
-static int sortCPUIDByMaxFrequency(std::vector<int>& cpuIDs, int* littleClusterOffset) {
-    const int cpuNumbers = cpuIDs.size();
-    *littleClusterOffset = 0;
-    if (cpuNumbers == 0) {
-        return 0;
-    }
-    std::vector<int> cpusFrequency;
-    cpusFrequency.resize(cpuNumbers);
-    for (int i = 0; i < cpuNumbers; ++i) {
-        int frequency    = getCPUMaxFreqKHz(i);
-        cpuIDs[i]        = i;
-        cpusFrequency[i] = frequency;
-        // MNN_PRINT("cpu fre: %d, %d\n", i, frequency);
-    }
-    for (int i = 0; i < cpuNumbers; ++i) {
-        for (int j = i + 1; j < cpuNumbers; ++j) {
-            if (cpusFrequency[i] < cpusFrequency[j]) {
-                // id
-                int temp  = cpuIDs[i];
-                cpuIDs[i] = cpuIDs[j];
-                cpuIDs[j] = temp;
-                // frequency
-                temp             = cpusFrequency[i];
-                cpusFrequency[i] = cpusFrequency[j];
-                cpusFrequency[j] = temp;
-            }
-        }
-    }
-    int midMaxFrequency = (cpusFrequency.front() + cpusFrequency.back()) / 2;
-    if (midMaxFrequency == cpusFrequency.back()) {
-        return 0;
-    }
-    for (int i = 0; i < cpuNumbers; ++i) {
-        if (cpusFrequency[i] < midMaxFrequency) {
-            *littleClusterOffset = i;
-            break;
-        }
-    }
-    return 0;
-}
-
-static int setSchedAffinity(const std::vector<int>& cpuIDs) {
-#define CPU_SETSIZE 1024
-#define __NCPUBITS (8 * sizeof(unsigned long))
-    typedef struct {
-        unsigned long __bits[CPU_SETSIZE / __NCPUBITS];
-    } cpu_set_t;
-
-#define CPU_SET(cpu, cpusetp) ((cpusetp)->__bits[(cpu) / __NCPUBITS] |= (1UL << ((cpu) % __NCPUBITS)))
-
-#define CPU_ZERO(cpusetp) memset((cpusetp), 0, sizeof(cpu_set_t))
-
-    // set affinity for thread
+int MNNGetCurrentPid() {
+#if defined (__linux__)
 #ifdef __GLIBC__
     pid_t pid = syscall(SYS_gettid);
 #else
@@ -169,9 +93,66 @@ static int setSchedAffinity(const std::vector<int>& cpuIDs) {
     pid_t pid = gettid();
 #endif
 #endif
+    return pid;
+#else
+    return 0;
+#endif
+}
+
+#if defined (__linux__)
+// Referenced from: (LINUX) bits/cpu-set.h
+// https://sourceware.org/git/?p=glibc.git;a=blob_plain;f=posix/bits/cpu-set.h;hb=HEAD
+// Copied from: (ANDROID) libc/include/sched.h
+// https://android.googlesource.com/platform/bionic.git/+/master/libc/include/sched.h
+#ifdef __LP64__
+#define CPU_SETSIZE 1024
+#else
+#define CPU_SETSIZE 32
+#endif
+#define __CPU_BITTYPE  unsigned long int  /* mandated by the kernel  */
+#define __CPU_BITS     (8 * sizeof(__CPU_BITTYPE))
+#define __CPU_ELT(x)   ((x) / __CPU_BITS)
+#define __CPU_MASK(x)  ((__CPU_BITTYPE)1 << ((x) & (__CPU_BITS - 1)))
+/**
+ * [CPU_ZERO](https://man7.org/linux/man-pages/man3/CPU_ZERO.3.html) clears all
+ * bits in a static CPU set.
+ */
+#define CPU_ZERO(set) CPU_ZERO_S(sizeof(cpu_set_t), set)
+/**
+ * [CPU_ZERO_S](https://man7.org/linux/man-pages/man3/CPU_ZERO_S.3.html) clears
+ * all bits in a dynamic CPU set allocated by `CPU_ALLOC`.
+ */
+#define CPU_ZERO_S(setsize, set) __builtin_memset(set, 0, setsize)
+/**
+ * [CPU_SET](https://man7.org/linux/man-pages/man3/CPU_SET.3.html) sets one
+ * bit in a static CPU set.
+ */
+#define CPU_SET(cpu, set) CPU_SET_S(cpu, sizeof(cpu_set_t), set)
+/**
+ * [CPU_SET_S](https://man7.org/linux/man-pages/man3/CPU_SET_S.3.html) sets one
+ * bit in a dynamic CPU set allocated by `CPU_ALLOC`.
+ */
+#define CPU_SET_S(cpu, setsize, set)                              \
+    do {                                                          \
+        size_t __cpu = (cpu);                                     \
+        if (__cpu < 8 * (setsize))                                \
+            (set)->__bits[__CPU_ELT(__cpu)] |= __CPU_MASK(__cpu); \
+    } while (0)
+#endif
+int MNNSetSchedAffinity(const int* cpuIDs, int size) {
+#if defined (__linux__)
+    /**
+     * [cpu_set_t](https://man7.org/linux/man-pages/man3/CPU_SET.3.html) is a
+     * statically-sized CPU set. See `CPU_ALLOC` for dynamically-sized CPU sets.
+     */
+    typedef struct {
+        __CPU_BITTYPE __bits[CPU_SETSIZE / __CPU_BITS];
+    } cpu_set_t;
+    // set affinity for thread
+    pid_t pid = MNNGetCurrentPid();
     cpu_set_t mask;
     CPU_ZERO(&mask);
-    for (int i = 0; i < (int)cpuIDs.size(); i++) {
+    for (int i = 0; i < size; i++) {
         CPU_SET(cpuIDs[i], &mask);
     }
 
@@ -180,101 +161,124 @@ static int setSchedAffinity(const std::vector<int>& cpuIDs) {
         MNN_PRINT("syscall error %d\n", syscallret);
         return -1;
     }
-
-    return 0;
-}
-
-#endif // arch
-
-int MNNSetCPUThreadsMode(MNNCPUThreadsMode mode) {
-#ifdef __ANDROID__
-    auto numberOfCPUs = getNumberOfCPU();
-    if (mode == MNN_CPU_MODE_DEFAULT) {
-        return 0;
-    }
-    static std::vector<int> sortedCPUIDs;
-    static int littleClusterOffset = 0;
-    if (sortedCPUIDs.empty()) {
-        sortedCPUIDs.resize(numberOfCPUs);
-        for (int i = 0; i < numberOfCPUs; ++i) {
-            sortedCPUIDs[i] = i;
-        }
-        sortCPUIDByMaxFrequency(sortedCPUIDs, &littleClusterOffset);
-    }
-
-    if (littleClusterOffset == 0 && mode != MNN_CPU_MODE_POWER_FRI) {
-        MNN_PRINT("This CPU Arch Do NOT support for setting cpu thread mode\n");
-    }
-    std::vector<int> cpuAttachIDs;
-    switch (mode) {
-        case MNN_CPU_MODE_POWER_FRI:
-            cpuAttachIDs = sortedCPUIDs;
-            break;
-        case MNN_CPU_MODE_LITTLE:
-            cpuAttachIDs = std::vector<int>(sortedCPUIDs.begin() + littleClusterOffset, sortedCPUIDs.end());
-            break;
-        case MNN_CPU_MODE_BIG:
-            cpuAttachIDs = std::vector<int>(sortedCPUIDs.begin(), sortedCPUIDs.begin() + littleClusterOffset);
-            break;
-        default:
-            cpuAttachIDs = sortedCPUIDs;
-            break;
-    }
-
-#ifdef _OPENMP
-    const int threadsNumber = cpuAttachIDs.size();
-    omp_set_num_threads(threadsNumber);
-    std::vector<int> result(threadsNumber, 0);
-#pragma omp parallel for
-    for (int i = 0; i < threadsNumber; ++i) {
-        result[i] = setSchedAffinity(cpuAttachIDs);
-    }
-    for (int i = 0; i < threadsNumber; ++i) {
-        if (result[i] != 0) {
-            return -1;
-        }
-    }
-#else
-    int res   = setSchedAffinity(cpuAttachIDs);
-    if (res != 0) {
-        return -1;
-    }
-#endif // _OPENMP
-    return 0;
-#elif __IOS__
-    return -1;
-#else
-    return -1;
-#endif // arch
-}
-float MNNGetCPUFlops(uint32_t number) {
-    float flops = 2048.0f;
-#ifdef __ANDROID__
-    auto numberOfCPUs = getNumberOfCPU();
-    if (0 == numberOfCPUs) {
-        return flops;
-    }
-    std::vector<int> freqs;
-    freqs.resize(numberOfCPUs);
-    for (int i = 0; i < numberOfCPUs; ++i) {
-        freqs[i] = getCPUMaxFreqKHz(i);
-    }
-    std::sort(freqs.rbegin(), freqs.rend());
-    number = std::min(number, numberOfCPUs);
-    flops  = 0.0f;
-    for (uint32_t i = 0; i < number; ++i) {
-        flops += (float)freqs[i] / 1024.0f;
-    }
 #endif
-    return flops;
+    return 0;
+}
+
+cpu_mask_t MNNGetCPUMask(const std::vector<int>& cpuIds) {
+#if defined (__linux__)
+    /**
+     * [cpu_set_t](https://man7.org/linux/man-pages/man3/CPU_SET.3.html) is a
+     * statically-sized CPU set. See `CPU_ALLOC` for dynamically-sized CPU sets.
+     */
+    typedef struct {
+        __CPU_BITTYPE __bits[CPU_SETSIZE / __CPU_BITS];
+    } cpu_set_t;
+    cpu_set_t cpuMask;
+    CPU_ZERO(&cpuMask);
+    for (auto i :cpuIds){
+        CPU_SET(i, &cpuMask);
+    }
+    return cpuMask.__bits[0];
+#endif
+    return 0;
 }
 
 // cpuinfo
 // Reference from: https://github.com/pytorch/cpuinfo
+#if (defined(ENABLE_ARMV82) && defined(__arm__)) || (defined(__ANDROID__) && defined(__aarch64__))
 
-#if defined(__aarch64__) && defined(ENABLE_ARMV82)
+/* As per include/sys/system_properties.h in Android NDK */
+#define CPUINFO_HARDWARE_VALUE_MAX 64
+#define CPUINFO_BUILD_PROP_VALUE_MAX 92
 
-#ifdef __ANDROID__
+struct cpuinfo_android_properties {
+    char proc_cpuinfo_hardware[CPUINFO_HARDWARE_VALUE_MAX];
+    char ro_product_board[CPUINFO_BUILD_PROP_VALUE_MAX];
+    char ro_board_platform[CPUINFO_BUILD_PROP_VALUE_MAX];
+    char ro_mediatek_platform[CPUINFO_BUILD_PROP_VALUE_MAX];
+    char ro_arch[CPUINFO_BUILD_PROP_VALUE_MAX];
+    char ro_chipname[CPUINFO_BUILD_PROP_VALUE_MAX];
+    char ro_hardware_chipname[CPUINFO_BUILD_PROP_VALUE_MAX];
+};
+
+enum cpuinfo_android_chipset_property {
+    cpuinfo_android_chipset_property_proc_cpuinfo_hardware = 0,
+    cpuinfo_android_chipset_property_ro_product_board,
+    cpuinfo_android_chipset_property_ro_board_platform,
+    cpuinfo_android_chipset_property_ro_mediatek_platform,
+    cpuinfo_android_chipset_property_ro_arch,
+    cpuinfo_android_chipset_property_ro_chipname,
+    cpuinfo_android_chipset_property_ro_hardware_chipname,
+    cpuinfo_android_chipset_property_max,
+};
+
+enum cpuinfo_arm_chipset_vendor {
+    cpuinfo_arm_chipset_vendor_unknown = 0,
+    cpuinfo_arm_chipset_vendor_qualcomm,
+    cpuinfo_arm_chipset_vendor_mediatek,
+    cpuinfo_arm_chipset_vendor_samsung,
+    cpuinfo_arm_chipset_vendor_hisilicon,
+    cpuinfo_arm_chipset_vendor_actions,
+    cpuinfo_arm_chipset_vendor_allwinner,
+    cpuinfo_arm_chipset_vendor_amlogic,
+    cpuinfo_arm_chipset_vendor_broadcom,
+    cpuinfo_arm_chipset_vendor_lg,
+    cpuinfo_arm_chipset_vendor_leadcore,
+    cpuinfo_arm_chipset_vendor_marvell,
+    cpuinfo_arm_chipset_vendor_mstar,
+    cpuinfo_arm_chipset_vendor_novathor,
+    cpuinfo_arm_chipset_vendor_nvidia,
+    cpuinfo_arm_chipset_vendor_pinecone,
+    cpuinfo_arm_chipset_vendor_renesas,
+    cpuinfo_arm_chipset_vendor_rockchip,
+    cpuinfo_arm_chipset_vendor_spreadtrum,
+    cpuinfo_arm_chipset_vendor_telechips,
+    cpuinfo_arm_chipset_vendor_texas_instruments,
+    cpuinfo_arm_chipset_vendor_wondermedia,
+    cpuinfo_arm_chipset_vendor_max,
+};
+
+enum cpuinfo_arm_chipset_series {
+    cpuinfo_arm_chipset_series_unknown = 0,
+    cpuinfo_arm_chipset_series_qualcomm_qsd,
+    cpuinfo_arm_chipset_series_qualcomm_msm,
+    cpuinfo_arm_chipset_series_qualcomm_apq,
+    cpuinfo_arm_chipset_series_qualcomm_snapdragon,
+    cpuinfo_arm_chipset_series_mediatek_mt,
+    cpuinfo_arm_chipset_series_samsung_exynos,
+    cpuinfo_arm_chipset_series_hisilicon_k3v,
+    cpuinfo_arm_chipset_series_hisilicon_hi,
+    cpuinfo_arm_chipset_series_hisilicon_kirin,
+    cpuinfo_arm_chipset_series_actions_atm,
+    cpuinfo_arm_chipset_series_allwinner_a,
+    cpuinfo_arm_chipset_series_amlogic_aml,
+    cpuinfo_arm_chipset_series_amlogic_s,
+    cpuinfo_arm_chipset_series_broadcom_bcm,
+    cpuinfo_arm_chipset_series_lg_nuclun,
+    cpuinfo_arm_chipset_series_leadcore_lc,
+    cpuinfo_arm_chipset_series_marvell_pxa,
+    cpuinfo_arm_chipset_series_mstar_6a,
+    cpuinfo_arm_chipset_series_novathor_u,
+    cpuinfo_arm_chipset_series_nvidia_tegra_t,
+    cpuinfo_arm_chipset_series_nvidia_tegra_ap,
+    cpuinfo_arm_chipset_series_nvidia_tegra_sl,
+    cpuinfo_arm_chipset_series_pinecone_surge_s,
+    cpuinfo_arm_chipset_series_renesas_mp,
+    cpuinfo_arm_chipset_series_rockchip_rk,
+    cpuinfo_arm_chipset_series_spreadtrum_sc,
+    cpuinfo_arm_chipset_series_telechips_tcc,
+    cpuinfo_arm_chipset_series_texas_instruments_omap,
+    cpuinfo_arm_chipset_series_wondermedia_wm,
+    cpuinfo_arm_chipset_series_max,
+};
+
+struct cpuinfo_arm_chipset {
+    enum cpuinfo_arm_chipset_vendor vendor;
+    enum cpuinfo_arm_chipset_series series;
+    uint32_t model;
+    char suffix[8];
+};
 
 #define CPUINFO_ARM_MIDR_IMPLEMENTER_MASK UINT32_C(0xFF000000)
 #define CPUINFO_ARM_MIDR_VARIANT_MASK UINT32_C(0x00F00000)
@@ -296,10 +300,6 @@ float MNNGetCPUFlops(uint32_t number) {
 #define CPUINFO_ARM_MIDR_ARCHITECTURE_OFFSET 16
 #define CPUINFO_ARM_MIDR_PART_OFFSET 4
 #define CPUINFO_ARM_MIDR_REVISION_OFFSET 0
-
-#define CPUINFO_ARM_LINUX_FEATURE_FPHP UINT32_C(0x00000200)
-#define CPUINFO_ARM_LINUX_FEATURE_ASIMDHP UINT32_C(0x00000400)
-#define CPUINFO_ARM_LINUX_FEATURE_ASIMDDP UINT32_C(0x00100000)
 
 struct cpuinfo_arm_linux_processor {
     uint32_t architecture_version;
@@ -347,8 +347,8 @@ inline static uint32_t midr_set_variant(uint32_t midr, uint32_t variant) {
            ((variant << CPUINFO_ARM_MIDR_VARIANT_OFFSET) & CPUINFO_ARM_MIDR_VARIANT_MASK);
 }
 
-uint32_t cpuinfo_arm_linux_hwcap_from_getauxval(void) {
-    return (uint32_t)getauxval(AT_HWCAP);
+inline static uint32_t midr_get_variant(uint32_t midr) {
+    return (midr & CPUINFO_ARM_MIDR_VARIANT_MASK) >> CPUINFO_ARM_MIDR_VARIANT_OFFSET;
 }
 
 static inline bool bitmask_all(uint32_t bitfield, uint32_t mask) {
@@ -667,11 +667,6 @@ static bool parse_line(const char* line_start, const char* line_end, struct proc
     const size_t key_length = key_end - line_start;
     switch (key_length) {
         case 6:
-            if (memcmp(line_start, "Serial", key_length) == 0) {
-                /* Usually contains just zeros, useless */
-            } else {
-                MNN_PRINT("unknown /proc/cpuinfo key: %.*s\n", (int)key_length, line_start);
-            }
             break;
         case 8:
             if (memcmp(line_start, "CPU part", key_length) == 0) {
@@ -695,8 +690,6 @@ static bool parse_line(const char* line_start, const char* line_end, struct proc
                 MNN_PRINT("parsed /proc/cpuinfo Hardware = \"%.*s\"\n", (int)value_length, value_start);
             } else if (memcmp(line_start, "Revision", key_length) == 0) {
                 /* Board revision, no use for now */
-            } else {
-                MNN_PRINT("unknown /proc/cpuinfo key: %.*s\n", (int)key_length, line_start);
             }
             break;
         case 9:
@@ -723,22 +716,16 @@ static bool parse_line(const char* line_start, const char* line_end, struct proc
                 return true;
             } else if (memcmp(line_start, "Processor", key_length) == 0) {
                 /* TODO: parse to fix misreported architecture, similar to Android's cpufeatures */
-            } else {
-                MNN_PRINT("unknown /proc/cpuinfo key: %.*s\n", (int)key_length, line_start);
             }
             break;
         case 11:
             if (memcmp(line_start, "CPU variant", key_length) == 0) {
                 parse_cpu_variant(value_start, value_end, processor);
-            } else {
-                MNN_PRINT("unknown /proc/cpuinfo key: %.*s\n", (int)key_length, line_start);
             }
             break;
         case 12:
             if (memcmp(line_start, "CPU revision", key_length) == 0) {
                 parse_cpu_revision(value_start, value_end, processor);
-            } else {
-                MNN_PRINT("unknown /proc/cpuinfo key: %.*s\n", (int)key_length, line_start);
             }
             break;
         case 15:
@@ -746,19 +733,15 @@ static bool parse_line(const char* line_start, const char* line_end, struct proc
                 parse_cpu_implementer(value_start, value_end, processor);
             } else if (memcmp(line_start, "CPU implementor", key_length) == 0) {
                 parse_cpu_implementer(value_start, value_end, processor);
-            } else {
-                MNN_PRINT("unknown /proc/cpuinfo key: %.*s\n", (int)key_length, line_start);
             }
             break;
         case 16:
             if (memcmp(line_start, "CPU architecture", key_length) == 0) {
                 parse_cpu_architecture(value_start, value_end, processor);
-            } else {
-                MNN_PRINT("unknown /proc/cpuinfo key: %.*s\n", (int)key_length, line_start);
             }
             break;
         default:
-            MNN_PRINT("unknown /proc/cpuinfo key: %.*s\n", (int)key_length, line_start);
+            break;
     }
     return true;
 }
@@ -868,43 +851,6 @@ void cpuinfo_arm_android_parse_properties(struct cpuinfo_android_properties* pro
     cpuinfo_android_property_get("ro.chipname", properties->ro_chipname);
     cpuinfo_android_property_get("ro.hardware.chipname", properties->ro_hardware_chipname);
 }
-
-/*
- * Map from ARM chipset series ID to ARM chipset vendor ID.
- * This map is used to avoid storing vendor IDs in tables.
- */
-static enum cpuinfo_arm_chipset_vendor chipset_series_vendor[cpuinfo_arm_chipset_series_max] = {
-    [cpuinfo_arm_chipset_series_unknown]                = cpuinfo_arm_chipset_vendor_unknown,
-    [cpuinfo_arm_chipset_series_qualcomm_qsd]           = cpuinfo_arm_chipset_vendor_qualcomm,
-    [cpuinfo_arm_chipset_series_qualcomm_msm]           = cpuinfo_arm_chipset_vendor_qualcomm,
-    [cpuinfo_arm_chipset_series_qualcomm_apq]           = cpuinfo_arm_chipset_vendor_qualcomm,
-    [cpuinfo_arm_chipset_series_qualcomm_snapdragon]    = cpuinfo_arm_chipset_vendor_qualcomm,
-    [cpuinfo_arm_chipset_series_mediatek_mt]            = cpuinfo_arm_chipset_vendor_mediatek,
-    [cpuinfo_arm_chipset_series_samsung_exynos]         = cpuinfo_arm_chipset_vendor_samsung,
-    [cpuinfo_arm_chipset_series_hisilicon_k3v]          = cpuinfo_arm_chipset_vendor_hisilicon,
-    [cpuinfo_arm_chipset_series_hisilicon_hi]           = cpuinfo_arm_chipset_vendor_hisilicon,
-    [cpuinfo_arm_chipset_series_hisilicon_kirin]        = cpuinfo_arm_chipset_vendor_hisilicon,
-    [cpuinfo_arm_chipset_series_actions_atm]            = cpuinfo_arm_chipset_vendor_actions,
-    [cpuinfo_arm_chipset_series_allwinner_a]            = cpuinfo_arm_chipset_vendor_allwinner,
-    [cpuinfo_arm_chipset_series_amlogic_aml]            = cpuinfo_arm_chipset_vendor_amlogic,
-    [cpuinfo_arm_chipset_series_amlogic_s]              = cpuinfo_arm_chipset_vendor_amlogic,
-    [cpuinfo_arm_chipset_series_broadcom_bcm]           = cpuinfo_arm_chipset_vendor_broadcom,
-    [cpuinfo_arm_chipset_series_lg_nuclun]              = cpuinfo_arm_chipset_vendor_lg,
-    [cpuinfo_arm_chipset_series_leadcore_lc]            = cpuinfo_arm_chipset_vendor_leadcore,
-    [cpuinfo_arm_chipset_series_marvell_pxa]            = cpuinfo_arm_chipset_vendor_marvell,
-    [cpuinfo_arm_chipset_series_mstar_6a]               = cpuinfo_arm_chipset_vendor_mstar,
-    [cpuinfo_arm_chipset_series_novathor_u]             = cpuinfo_arm_chipset_vendor_novathor,
-    [cpuinfo_arm_chipset_series_nvidia_tegra_t]         = cpuinfo_arm_chipset_vendor_nvidia,
-    [cpuinfo_arm_chipset_series_nvidia_tegra_ap]        = cpuinfo_arm_chipset_vendor_nvidia,
-    [cpuinfo_arm_chipset_series_nvidia_tegra_sl]        = cpuinfo_arm_chipset_vendor_nvidia,
-    [cpuinfo_arm_chipset_series_pinecone_surge_s]       = cpuinfo_arm_chipset_vendor_pinecone,
-    [cpuinfo_arm_chipset_series_renesas_mp]             = cpuinfo_arm_chipset_vendor_renesas,
-    [cpuinfo_arm_chipset_series_rockchip_rk]            = cpuinfo_arm_chipset_vendor_rockchip,
-    [cpuinfo_arm_chipset_series_spreadtrum_sc]          = cpuinfo_arm_chipset_vendor_spreadtrum,
-    [cpuinfo_arm_chipset_series_telechips_tcc]          = cpuinfo_arm_chipset_vendor_telechips,
-    [cpuinfo_arm_chipset_series_texas_instruments_omap] = cpuinfo_arm_chipset_vendor_texas_instruments,
-    [cpuinfo_arm_chipset_series_wondermedia_wm]         = cpuinfo_arm_chipset_vendor_wondermedia,
-};
 
 static inline uint16_t load_u16le(const void* ptr) {
     return *((const uint16_t*)ptr);
@@ -1228,15 +1174,15 @@ struct cpuinfo_arm_chipset cpuinfo_arm_android_decode_chipset(const struct cpuin
             if (vendor == cpuinfo_arm_chipset_vendor_unknown) {
                 vendor = decoded_vendor;
             } else if (vendor != decoded_vendor) {
-                MNN_PRINT(
-                    "[MNN WARNING] chipset detection failed: different chipset vendors reported in different system "
-                    "properties\n");
+//                MNN_PRINT(
+//                    "[MNN WARNING] chipset detection failed: different chipset vendors reported in different system "
+//                    "properties\n");
                 return chipset;
             }
         }
     }
     if (vendor == cpuinfo_arm_chipset_vendor_unknown) {
-        MNN_PRINT("[MNN WARNING] chipset detection failed: none of the system properties matched known signatures\n");
+//        MNN_PRINT("[MNN WARNING] chipset detection failed: none of the system properties matched known signatures\n");
         return chipset;
     }
 
@@ -1250,39 +1196,18 @@ struct cpuinfo_arm_chipset cpuinfo_arm_android_decode_chipset(const struct cpuin
     // MNN_PRINT("chipset vendor, series, model is: %d, %d, %d\n", chipset.vendor, chipset.series, chipset.model);
     return chipset;
 }
-
-#endif // __ANDROID__
-
-#if defined(__IOS__) && defined(__aarch64__)
-
-static uint32_t get_sys_info_by_name(const char* type_specifier) {
-    size_t size     = 0;
-    uint32_t result = 0;
-    if (sysctlbyname(type_specifier, NULL, &size, NULL, 0) != 0) {
-        MNN_PRINT("sysctlbyname(\"%s\") failed\n", type_specifier);
-    } else if (size == sizeof(uint32_t)) {
-        sysctlbyname(type_specifier, &result, &size, NULL, 0);
-        MNN_PRINT("%s: %u , size = %lu\n", type_specifier, result, size);
-    } else {
-        MNN_PRINT("sysctl does not support non-integer lookup for (\"%s\")\n", type_specifier);
-    }
-    return result;
-}
-
-#endif // iOS
-
-void cpuinfo_arm_init(struct cpuinfo_arm_isa* cpuinfo_isa) {
-    memset(cpuinfo_isa, 0, sizeof(struct cpuinfo_arm_isa));
-
-    // android
-#ifdef __ANDROID__
+static void _getInfoArm(MNNCPUInfo* cpuinfo_isa) {
+    // Get White List And Black List
     struct cpuinfo_arm_linux_processor* arm_linux_processors = NULL;
-    const uint32_t processors_count                          = getNumberOfCPU();
+    if (0 == cpuinfo_isa->groups.size()) {
+        return;
+    }
+    const uint32_t processors_count = cpuinfo_isa->cpuNumber;
 
     char proc_cpuinfo_hardware[CPUINFO_HARDWARE_VALUE_MAX] = {0};
 
     arm_linux_processors = static_cast<struct cpuinfo_arm_linux_processor*>(
-        calloc(processors_count, sizeof(struct cpuinfo_arm_linux_processor)));
+        malloc(processors_count * sizeof(struct cpuinfo_arm_linux_processor)));
     if (arm_linux_processors == NULL) {
         MNN_PRINT("failed to allocate %zu bytes for descriptions of %u ARM logical processors\n",
                   processors_count * sizeof(struct cpuinfo_arm_linux_processor), processors_count);
@@ -1291,6 +1216,7 @@ void cpuinfo_arm_init(struct cpuinfo_arm_isa* cpuinfo_isa) {
 
     if (!cpuinfo_arm_linux_parse_proc_cpuinfo(proc_cpuinfo_hardware, processors_count, arm_linux_processors)) {
         MNN_PRINT("failed to parse processor information from /proc/cpuinfo\n");
+        free(arm_linux_processors);
         return;
     }
 
@@ -1311,64 +1237,549 @@ void cpuinfo_arm_init(struct cpuinfo_arm_isa* cpuinfo_isa) {
             }
         }
     }
-
-    const uint32_t isa_features = cpuinfo_arm_linux_hwcap_from_getauxval();
-
     struct cpuinfo_android_properties android_properties;
     cpuinfo_arm_android_parse_properties(&android_properties);
     const struct cpuinfo_arm_chipset chipset =
         cpuinfo_arm_android_decode_chipset(&android_properties, valid_processors, 0);
-
+    // pytorch/cpuinfo: src/arm/linux/aarch32-isa.c
+    uint32_t architecture_version = 0;
+    if (processors_count > 0) {
+        architecture_version = arm_linux_processors[0].architecture_version;
+    }
+    if (architecture_version >= 8) {
+        FUNC_PRINT_ALL((last_midr & (CPUINFO_ARM_MIDR_IMPLEMENTER_MASK | CPUINFO_ARM_MIDR_PART_MASK)), 0x);
+        /*
+         * NEON FP16 compute extension and VQRDMLAH/VQRDMLSH instructions are not indicated in /proc/cpuinfo.
+         * Use a MIDR-based heuristic to whitelist processors known to support it:
+         * - Processors with Cortex-A55 cores
+         * - Processors with Cortex-A65 cores
+         * - Processors with Cortex-A75 cores
+         * - Processors with Cortex-A76 cores
+         * - Processors with Cortex-A77 cores
+         * - Processors with Exynos M4 cores
+         * - Processors with Exynos M5 cores
+         * - Neoverse N1 cores
+         */
+        if (chipset.series == cpuinfo_arm_chipset_series_samsung_exynos && chipset.model == 9810) {
+            /* Only little cores of Exynos 9810 support FP16 & RDM */
+            MNN_PRINT("FP16 arithmetics and RDM disabled: only little cores in Exynos 9810 support these extensions");
+        } else {
+            switch (last_midr & (CPUINFO_ARM_MIDR_IMPLEMENTER_MASK | CPUINFO_ARM_MIDR_PART_MASK)) {
+                case UINT32_C(0x4100D050): /* Cortex-A55 */
+                case UINT32_C(0x4100D060): /* Cortex-A65 */
+                case UINT32_C(0x4100D0B0): /* Cortex-A76 */
+                case UINT32_C(0x4100d440): /* 888 */
+                case UINT32_C(0x4100d480): /* 8gen1 */
+                case UINT32_C(0x4100D0C0): /* Neoverse N1 */
+                case UINT32_C(0x4100D0D0): /* Cortex-A77 */
+                case UINT32_C(0x4100D0E0): /* Cortex-A76AE */
+                case UINT32_C(0x4800D400): /* Cortex-A76 (HiSilicon) */
+                case UINT32_C(0x51008020): /* Kryo 385 Gold (Cortex-A75) */
+                case UINT32_C(0x51008030): /* Kryo 385 Silver (Cortex-A55) */
+                case UINT32_C(0x51008040): /* Kryo 485 Gold (Cortex-A76) */
+                case UINT32_C(0x51008050): /* Kryo 485 Silver (Cortex-A55) */
+                case UINT32_C(0x53000030): /* Exynos M4 */
+                case UINT32_C(0x53000040): /* Exynos M5 */
+                    cpuinfo_isa->fp16arith = true;
+                    break;
+            }
+        }
+        /*
+         * NEON VDOT instructions are not indicated in /proc/cpuinfo.
+         * Use a MIDR-based heuristic to whitelist processors known to support it.
+         */
+        switch (last_midr & (CPUINFO_ARM_MIDR_IMPLEMENTER_MASK | CPUINFO_ARM_MIDR_PART_MASK)) {
+            case UINT32_C(0x4100D0B0): /* Cortex-A76 */
+            case UINT32_C(0x4100D0D0): /* Cortex-A77 */
+            case UINT32_C(0x4100D0E0): /* Cortex-A76AE */
+            case UINT32_C(0x4100d440): /* 888 */
+            case UINT32_C(0x4100d480): /* 8gen1 */
+            case UINT32_C(0x4800D400): /* Cortex-A76 (HiSilicon) */
+            case UINT32_C(0x51008040): /* Kryo 485 Gold (Cortex-A76) */
+            case UINT32_C(0x51008050): /* Kryo 485 Silver (Cortex-A55) */
+            case UINT32_C(0x53000030): /* Exynos-M4 */
+            case UINT32_C(0x53000040): /* Exynos-M5 */
+                cpuinfo_isa->dot = true;
+                break;
+            case UINT32_C(0x4100D050): /* Cortex A55: revision 1 or later only */
+                cpuinfo_isa->dot = (midr_get_variant(last_midr) >= 1);
+                break;
+            case UINT32_C(0x4100D0A0): /* Cortex A75: revision 2 or later only */
+                cpuinfo_isa->dot = (midr_get_variant(last_midr) >= 2);
+                break;
+        }
+    }
+    // Whitelist
     switch (last_midr & (CPUINFO_ARM_MIDR_IMPLEMENTER_MASK | CPUINFO_ARM_MIDR_PART_MASK)) {
         case UINT32_C(0x51008040): /* Kryo 485 Gold (Cortex-A76) */
             cpuinfo_isa->dot = true;
             break;
         default:
-            if (isa_features & CPUINFO_ARM_LINUX_FEATURE_ASIMDDP) {
-                cpuinfo_isa->dot = true;
-            }
             // TODO, whitelist, ex: hisilicon_kirin 980...
             break;
     }
-
-    const uint32_t fp16arith_mask = CPUINFO_ARM_LINUX_FEATURE_FPHP | CPUINFO_ARM_LINUX_FEATURE_ASIMDHP;
-    if ((isa_features & fp16arith_mask) == fp16arith_mask) {
-        if (chipset.series == cpuinfo_arm_chipset_series_samsung_exynos && chipset.model == 9810) {
-            cpuinfo_isa->fp16arith = false;
-        } else {
-            cpuinfo_isa->fp16arith = true;
-        }
+    // Blacklist
+    if (chipset.series == cpuinfo_arm_chipset_series_samsung_exynos && chipset.model == 9810) {
+        // Spectial machine, disable fp16
+        cpuinfo_isa->fp16arith = false;
     }
-
-#endif // #ifdef __ANDROID__
-
-    // iOS
-#if defined(__IOS__) && defined(__aarch64__)
-
-// A11
-#ifndef CPUFAMILY_ARM_MONSOON_MISTRAL
-#define CPUFAMILY_ARM_MONSOON_MISTRAL 0xe81e7ef6
-#endif
-// A12
-#ifndef CPUFAMILY_ARM_VORTEX_TEMPEST
-#define CPUFAMILY_ARM_VORTEX_TEMPEST 0x07d34b9f
-#endif
-// A13
-#ifndef CPUFAMILY_ARM_LIGHTNING_THUNDER
-#define CPUFAMILY_ARM_LIGHTNING_THUNDER 0x462504d2
+    if (arm_linux_processors) {
+        free(arm_linux_processors);
+    }
+}
 #endif
 
-    const uint32_t cpu_family = get_sys_info_by_name("hw.cpufamily");
-    // const uint32_t cpu_type = get_sys_info_by_name("hw.cputype");
-    // const uint32_t cpu_subtype = get_sys_info_by_name("hw.cpusubtype");
+static int _getSME2CoreNumber();
 
-    cpuinfo_isa->fp16arith = cpu_family == CPUFAMILY_ARM_MONSOON_MISTRAL ||
-                             cpu_family == CPUFAMILY_ARM_VORTEX_TEMPEST ||
-                             cpu_family == CPUFAMILY_ARM_LIGHTNING_THUNDER;
-
-    cpuinfo_isa->dot = cpu_family == CPUFAMILY_ARM_LIGHTNING_THUNDER;
-
-#endif // iOS
+#if defined(__APPLE__) && defined(__aarch64__)
+static bool have_feature(const char* feature) {
+  // For more information on sysctlbyname(), see:
+  // https://developer.apple.com/documentation/kernel/1387446-sysctlbyname/determining_instruction_set_characteristics
+    int64_t feature_present = 0;
+    size_t size = sizeof(feature_present);
+    if (sysctlbyname(feature, &feature_present, &size, NULL, 0) != 0) {
+        return false;
+    }
+    return feature_present;
 }
 
-#endif // ENABLE_ARMV82
+static int _getAppleSME2CoreNumber() {
+    char chipName[256] = {};
+    size_t size = sizeof(chipName);
+    if (sysctlbyname("machdep.cpu.brand_string", chipName, &size, NULL, 0) != 0) {
+        return 1;
+    }
+    chipName[sizeof(chipName) - 1] = '\0';
+
+    struct AppleSME2CoreCount {
+        const char* chipName;
+        int coreCount;
+    };
+    // Apple does not expose SMIDR_EL1. Use the number of high-performance
+    // shared SMCUs that can run concurrent SME workers effectively. Some chips
+    // also have a much smaller SMCU shared by the efficiency-core cluster, which
+    // is not counted as an equivalent worker here.
+    static const AppleSME2CoreCount knownChips[] = {
+        {"Apple M4", 1},     {"Apple M4 Pro", 2}, {"Apple M4 Max", 2},  {"Apple M5", 1},  {"Apple M5 Pro", 2},
+        {"Apple M5 Max", 2}, {"Apple A18", 2},    {"Apple A18 Pro", 2}, {"Apple A19", 2}, {"Apple A19 Pro", 2},
+    };
+    for (const auto& knownChip : knownChips) {
+        if (strcmp(chipName, knownChip.chipName) == 0) {
+            return knownChip.coreCount;
+        }
+    }
+    // SME2 is present, but the model is unknown. Avoid over-subscribing a
+    // shared SMCU until the chip has been characterized.
+    return 1;
+}
+
+static void _getInfoApple(MNNCPUInfo* cpuinfo_isa) {
+    /**Ref from
+     https://developer.apple.com/documentation/kernel/1387446-sysctlbyname/determining_instruction_set_characteristics
+     */
+    if (have_feature("hw.optional.arm.FEAT_FP16")) {
+        cpuinfo_isa->fp16arith = true;
+    }
+#if defined(MNN_SME2) && defined(MNN_SUPPORT_TRANSFORMER_FUSE)
+    if (have_feature("hw.optional.arm.FEAT_FHM")) {
+        cpuinfo_isa->fp16fml = true;
+    }
+#endif
+    if (have_feature("hw.optional.arm.FEAT_DotProd")) {
+        cpuinfo_isa->dot = true;
+    }
+    if (have_feature("hw.optional.arm.FEAT_I8MM")) {
+        cpuinfo_isa->i8mm = true;
+    }
+    if (have_feature("hw.optional.arm.FEAT_SME2")) {
+        cpuinfo_isa->sme2 = true;
+        cpuinfo_isa->smeCoreNumber = _getSME2CoreNumber();
+    }
+    int perfCores = 0;
+    size_t perfCoresSize = sizeof(perfCores);
+    if (sysctlbyname("hw.perflevel0.physicalcpu", &perfCores, &perfCoresSize, NULL, 0) == 0) {
+        cpuinfo_isa->perfCoreNumber = perfCores;
+    }
+}
+#endif
+
+#if defined(__linux__) && defined(__aarch64__)
+// SMIDR_EL1.NSMC[59:56] is the number of SMCUs behind one shared affinity ID minus one, so a
+// single ID can stand for several units. 0b1111 is reserved and falls back to a single unit.
+static int _sharedSmcuUnits(uint64_t smidr) {
+    const uint32_t nsmc = static_cast<uint32_t>((smidr >> 56) & 0xF);
+    return nsmc > 14 ? 1 : static_cast<int>(nsmc) + 1;
+}
+
+static int _countSME2Cores(const std::vector<uint64_t>& smidrs) {
+    struct SharedGroup {
+        uint32_t affinity;
+        int units;
+    };
+    int privateCount = 0;
+    std::vector<SharedGroup> sharedGroups;
+    for (const auto smidr : smidrs) {
+        const uint32_t sharing = static_cast<uint32_t>((smidr >> 13) & 0x3);
+        // SMIDR_EL1.Affinity2[51:32] and Affinity[11:0] form one 32-bit ID.
+        const uint32_t affinity =
+            static_cast<uint32_t>((smidr & UINT64_C(0xFFF)) | ((smidr >> 20) & UINT64_C(0xFFFFF000)));
+        bool isShared = false;
+        switch (sharing) {
+            case 0x2: // The PE has a private SMCU.
+                ++privateCount;
+                break;
+            case 0x3: // PEs with the same affinity share SMCUs.
+                isShared = true;
+                break;
+            case 0x0:
+                // Legacy/ambiguous encoding: affinity 0 means private, otherwise shared.
+                if (affinity == 0) {
+                    ++privateCount;
+                } else {
+                    isShared = true;
+                }
+                break;
+            default: // 0x1 is reserved.
+                break;
+        }
+        if (!isShared) {
+            continue;
+        }
+        auto known = sharedGroups.begin();
+        for (; known != sharedGroups.end(); ++known) {
+            if (known->affinity == affinity) {
+                break;
+            }
+        }
+        const int units = _sharedSmcuUnits(smidr);
+        if (known == sharedGroups.end()) {
+            sharedGroups.push_back({affinity, units});
+        } else if (units < known->units) {
+            // PEs of one group should report the same NSMC; if not, keep the smaller count so a
+            // shared SMCU is never oversubscribed.
+            known->units = units;
+        }
+    }
+    int sharedCount = 0;
+    for (const auto& group : sharedGroups) {
+        sharedCount += group.units;
+    }
+    return privateCount + sharedCount;
+}
+
+static int _getLinuxSME2CoreNumber() {
+    const char* cpuRoot = "/sys/devices/system/cpu";
+    DIR* root = opendir(cpuRoot);
+    if (root == NULL) {
+        return 1;
+    }
+
+    std::vector<uint64_t> smidrs;
+    struct dirent* entry;
+    while ((entry = readdir(root)) != NULL) {
+        const char* name = entry->d_name;
+        if (strncmp(name, "cpu", 3) != 0 || name[3] == '\0') {
+            continue;
+        }
+        bool isCPU = true;
+        for (const char* cursor = name + 3; *cursor != '\0'; ++cursor) {
+            if (*cursor < '0' || *cursor > '9') {
+                isCPU = false;
+                break;
+            }
+        }
+        if (!isCPU) {
+            continue;
+        }
+
+        const std::string path = std::string(cpuRoot) + "/" + name + "/regs/identification/smidr_el1";
+        FILE* file = fopen(path.c_str(), "r");
+        if (file == NULL) {
+            continue;
+        }
+        unsigned long long smidr = 0;
+        const bool valid = fscanf(file, "%llx", &smidr) == 1;
+        fclose(file);
+        if (valid) {
+            smidrs.emplace_back(static_cast<uint64_t>(smidr));
+        }
+    }
+    closedir(root);
+
+    const int count = _countSME2Cores(smidrs);
+    return count > 0 ? count : 1;
+}
+#endif
+
+static int _getSME2CoreNumber() {
+#if defined(__linux__) && defined(__aarch64__)
+    return _getLinuxSME2CoreNumber();
+#elif defined(__APPLE__) && defined(__aarch64__)
+    return _getAppleSME2CoreNumber();
+#else
+    return 0;
+#endif
+}
+
+#if defined(__linux__) && defined(__aarch64__)
+static void _getInfoAux(MNNCPUInfo* cpuinfo_isa) {
+    // Use AUX to get info for linux-aarch64
+    uint32_t isa_features = 0;
+    uint64_t isa_features2 = 0;
+    // HWCAP features
+    isa_features = (uint32_t)getauxval(AT_HWCAP);
+    if (isa_features & CPUINFO_ARM_LINUX_FEATURE_ASIMDDP) {
+        cpuinfo_isa->dot = true;
+    }
+    const uint32_t fp16arith_mask = CPUINFO_ARM_LINUX_FEATURE_FPHP | CPUINFO_ARM_LINUX_FEATURE_ASIMDHP;
+    if ((isa_features & fp16arith_mask) == fp16arith_mask) {
+        cpuinfo_isa->fp16arith = true;
+    }
+#if defined(MNN_SME2) && defined(MNN_SUPPORT_TRANSFORMER_FUSE)
+    if (isa_features & CPUINFO_ARM_LINUX_FEATURE_ASIMDFHM) {
+        cpuinfo_isa->fp16fml = true;
+    }
+#endif
+    // HWCAP2 features
+    isa_features2 = (uint64_t)getauxval(AT_HWCAP2);
+    if (isa_features2 & CPUINFO_ARM_LINUX_FEATURE2_I8MM) {
+        cpuinfo_isa->i8mm = true;
+    }
+    if (isa_features2 & CPUINFO_ARM_LINUX_FEATURE2_SVE2) {
+        cpuinfo_isa->sve2 = true;
+    }
+    if (isa_features2 & CPUINFO_ARM_LINUX_FEATURE2_SME2) {
+        cpuinfo_isa->sme2 = true;
+        cpuinfo_isa->smeCoreNumber = _getSME2CoreNumber();
+    }
+}
+#endif
+//Riscv support
+#if defined(__linux__) && defined(__riscv)
+// riscv_hwprobe(2) ABI, from arch/riscv/include/uapi/asm/hwprobe.h. Only the
+// pair struct is borrowed from the kernel header; the key and the bit masks are
+// spelled out here because upstream defines the top bit as a signed
+// `(1 << 31)`, which sign-extends to 0xffffffff80000000 once promoted to
+// uint64_t and would then alias every extension bit above 31.
+#if defined(MNN_HAS_RISCV_HWPROBE_H)
+using MNNRiscvHwprobe = riscv_hwprobe;
+#else
+struct MNNRiscvHwprobe {
+    int64_t key;
+    uint64_t value;
+};
+#endif
+
+#if defined(__NR_riscv_hwprobe)
+static const long gRISCVHwprobeNr = __NR_riscv_hwprobe;
+#else
+// RISC-V Linux reserves syscall 258 for riscv_hwprobe.
+static const long gRISCVHwprobeNr = 258;
+#endif
+
+static const int64_t gRISCVHwprobeKeyImaExt0 = 4;
+static const uint64_t gRISCVHwprobeImaV = 1ULL << 2;
+static const uint64_t gRISCVHwprobeExtZvfh = 1ULL << 30;
+static const uint64_t gRISCVHwprobeExtZvfhmin = 1ULL << 31;
+
+static void _getRISCVInfoHwprobe(MNNCPUInfo* cpuinfo) {
+    // The cpufreq scan in _fillInfo is the primary source for cpuNumber, but it
+    // is skipped entirely on boards that expose no cpufreq policy, so keep a
+    // fallback here rather than leaving the count at zero.
+    if (cpuinfo->cpuNumber <= 0) {
+        cpuinfo->cpuNumber = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    }
+    if (cpuinfo->cpuNumber <= 0) {
+        cpuinfo->cpuNumber = (int)sysconf(_SC_NPROCESSORS_CONF);
+    }
+
+    MNNRiscvHwprobe pair = {gRISCVHwprobeKeyImaExt0, 0};
+    // Args are pairs, pair_count, cpusetsize, cpus, flags. A zero cpusetsize
+    // with a null set queries every online CPU and the kernel ANDs the
+    // extension bits across them, so dispatch survives thread migration.
+    long result = syscall(gRISCVHwprobeNr, &pair, (size_t)1, (size_t)0, (void*)NULL, 0u);
+    if (0 != result || pair.key != gRISCVHwprobeKeyImaExt0) {
+        // Kernels older than 6.4 fail the call with ENOSYS; a key the running
+        // kernel does not recognise is rewritten to -1 with a zero value.
+        return;
+    }
+
+    cpuinfo->rvv = 0 != (pair.value & gRISCVHwprobeImaV);
+    if (!cpuinfo->rvv) {
+        return;
+    }
+    // The Zvfh / Zvfhmin bits were only added in Linux 6.8; on an older kernel
+    // they read back as zero, which is reported here as "not available".
+    cpuinfo->zvfh = 0 != (pair.value & gRISCVHwprobeExtZvfh);
+    // Zvfh is a superset of Zvfhmin, so treat it as providing the minimal FP16
+    // conversion capability even on a kernel that only sets the Zvfh bit.
+    cpuinfo->zvfhmin = cpuinfo->zvfh || 0 != (pair.value & gRISCVHwprobeExtZvfhmin);
+
+    // Zvfhmin only adds FP16<->FP32 vector conversion. Keep fp16arith tied to
+    // full Zvfh, which additionally provides FP16 vector arithmetic.
+    if (cpuinfo->zvfh) {
+        cpuinfo->fp16arith = true;
+    }
+}
+
+#endif
+
+
+static bool _readAll(const std::string& fileName, MNN::AutoStorage<uint8_t>& buffer) {
+    MNN::FileLoader l(fileName.c_str());
+    if (false == l.read()) {
+        return false;
+    }
+    return l.merge(buffer);
+}
+static std::vector<int> _readNumber(const char* data, int length) {
+    int current = -1;
+    std::vector<int> res;
+    for (int i=0; i<length; ++i) {
+        auto c = data[i];
+        if (c < '0' || c > '9') {
+            if (current >=0 ) {
+                res.emplace_back(current);
+                current = -1;
+            }
+            continue;
+        }
+        if (current >= 0) {
+            current = current*10 + (c - '0');
+        } else {
+            current = c - '0';
+        }
+    }
+    if (current >=0 ) {
+        res.emplace_back(current);
+        current = -1;
+    }
+    return res;
+}
+static MNNCPUInfo* gCPUInfo = nullptr;
+static void _fillInfo(MNNCPUInfo* cpuInfo);
+const MNNCPUInfo* MNNGetCPUInfo() {
+    if (nullptr != gCPUInfo) {
+        return gCPUInfo;
+    }
+    gCPUInfo = new MNNCPUInfo;
+    _fillInfo(gCPUInfo);
+    return gCPUInfo;
+}
+
+static void _fillInfo(MNNCPUInfo* cpuinfo_isa) {
+    cpuinfo_isa->dot = false;
+    cpuinfo_isa->fp16arith = false;
+    cpuinfo_isa->i8mm = false;
+    cpuinfo_isa->sve2 = false;
+    cpuinfo_isa->sme2 = false;
+#if defined(MNN_SME2) && defined(MNN_SUPPORT_TRANSFORMER_FUSE)
+    cpuinfo_isa->fp16fml = false;
+#endif
+    // android
+    /**Get CPU Info*/
+#ifdef __linux__
+    do {
+        DIR* root;
+        std::string dir = "/sys/devices/system/cpu/cpufreq";
+        if ((root = opendir(dir.c_str())) == NULL) {
+            break;
+        }
+        CPUGroup group;
+        struct dirent* ent;
+        while ((ent = readdir(root)) != NULL) {
+            if (ent->d_name[0] != '.' && ent->d_type == DT_DIR) {
+                std::string policyName = dir + "/" + ent->d_name;
+                std::string cpus = policyName + "/affected_cpus";
+                {
+                    MNN::AutoStorage<uint8_t> buffer;
+                    if (false == _readAll(cpus, buffer)) {
+                        continue;
+                    }
+                    group.ids = _readNumber((const char*)buffer.get(), buffer.size());
+                }
+                if (group.ids.empty()) {
+                    continue;
+                }
+                std::string minfreq = policyName + "/cpuinfo_min_freq";
+                {
+                    MNN::AutoStorage<uint8_t> buffer;
+                    if (_readAll(minfreq, buffer)) {
+                        auto freq = _readNumber((const char*)buffer.get(), buffer.size());
+                        if (freq.size() > 0) {
+                            group.minFreq = freq[0];
+                        }
+                    }
+                }
+                std::string maxfreq = policyName + "/cpuinfo_max_freq";
+                {
+                    MNN::AutoStorage<uint8_t> buffer;
+                    if (_readAll(maxfreq, buffer)) {
+                        auto freq = _readNumber((const char*)buffer.get(), buffer.size());
+                        if (freq.size() > 0) {
+                            group.maxFreq = freq[0];
+                        }
+                    }
+                }
+                cpuinfo_isa->groups.emplace_back(group);
+            }
+        }
+        closedir(root);
+        std::sort(cpuinfo_isa->groups.begin(), cpuinfo_isa->groups.end(), [](const CPUGroup& left, const CPUGroup& right) {
+            return left.maxFreq < right.maxFreq;
+        });
+        // Merge group if needed
+        if (cpuinfo_isa->groups.size() >= 2 && cpuinfo_isa->groups[0].maxFreq == cpuinfo_isa->groups[1].maxFreq) {
+            auto backupGroups = std::move(cpuinfo_isa->groups);
+            CPUGroup&& current = std::move(backupGroups[0]);
+            for (int v=1; v<backupGroups.size(); ++v) {
+                if (backupGroups[v].maxFreq != current.maxFreq) {
+                    cpuinfo_isa->groups.emplace_back(current);
+                    current = std::move(backupGroups[v]);
+                } else {
+                    current.ids.insert(current.ids.end(), backupGroups[v].ids.begin(), backupGroups[v].ids.end());
+                }
+            }
+            cpuinfo_isa->groups.emplace_back(current);
+        }
+        cpuinfo_isa->cpuNumber = 0;
+        for (auto& group : cpuinfo_isa->groups) {
+            cpuinfo_isa->cpuNumber += group.ids.size();
+            std::string message = "CPU Group: [";
+            for (int v=0; v<group.ids.size(); ++v) {
+                message += " " + std::to_string(group.ids[v]) + " ";
+            }
+            message += "], " + std::to_string(group.minFreq) + " - " + std::to_string(group.maxFreq);
+            MNN_PRINT("%s\n", message.c_str());
+        }
+    } while (false);
+
+#if defined(__aarch64__)
+    _getInfoAux(cpuinfo_isa);
+#endif
+ 
+//riscv support
+#if defined(__riscv)
+    _getRISCVInfoHwprobe(cpuinfo_isa);
+#endif
+
+
+#if (defined(ENABLE_ARMV82) && defined(__arm__)) || (defined(__ANDROID__) && defined(__aarch64__))
+    _getInfoArm(cpuinfo_isa);
+#endif // #ifdef arm / arm64
+#endif // #ifdef __linux__
+
+// MacOS / IOS
+#if defined(__APPLE__) && defined(__aarch64__)
+    _getInfoApple(cpuinfo_isa);
+#endif
+
+#if defined(__aarch64__) && defined(_WIN32)
+    cpuinfo_isa->fp16arith = true;
+    cpuinfo_isa->dot = true;
+#endif
+
+    MNN_PRINT("The device supports: i8sdot:%d, fp16:%d, i8mm: %d, sve2: %d, sme2: %d, perfCores: %d\n",
+            cpuinfo_isa->dot, cpuinfo_isa->fp16arith, cpuinfo_isa->i8mm, cpuinfo_isa->sve2, cpuinfo_isa->sme2, cpuinfo_isa->perfCoreNumber);
+    return;
+}

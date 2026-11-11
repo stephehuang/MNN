@@ -15,7 +15,7 @@
 namespace MNN {
 
 MetalPooling::MetalPooling(Backend *backend, const Pool *pooling)
-    : Execution(backend),
+    : MetalExecution(backend),
       mGlobal(pooling->isGlobal()),
       mPoolType(pooling->type()),
       mKernelX(pooling->kernelX()),
@@ -23,8 +23,20 @@ MetalPooling::MetalPooling(Backend *backend, const Pool *pooling)
       mStrideX(pooling->strideX()),
       mStrideY(pooling->strideY()),
       mPadX(pooling->padX()),
-      mPadY(pooling->padY()) {
-    // nothing to do
+      mPadY(pooling->padY()),
+      mCountIncludePadding(false) {
+    auto padType = pooling->padType();
+    if (!pooling->isGlobal() && pooling->pads() != nullptr && padType == PoolPadType_CAFFE &&
+        pooling->pads()->size() == 4) {
+        mPadY = pooling->pads()->data()[0];
+        mPadX = pooling->pads()->data()[1];
+        padType = PoolPadType_VALID;
+    }
+    auto countType = pooling->countType();
+    if (countType == AvgPoolCountType_DEFAULT) {
+        countType = (padType == PoolPadType_CAFFE) ? AvgPoolCountType_INCLUDE_PADDING : AvgPoolCountType_EXCLUDE_PADDING;
+    }
+    mCountIncludePadding = (countType == AvgPoolCountType_INCLUDE_PADDING);
 }
 
 ErrorCode MetalPooling::onResize(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) {
@@ -47,7 +59,7 @@ ErrorCode MetalPooling::onResize(const std::vector<Tensor *> &inputs, const std:
         padHeight    = 0;
     }
 
-    mConstBuffer                       = [context newDeviceBuffer:11 * sizeof(int) access:CPUWriteOnly];
+    mConstBuffer                       = [context newDeviceBuffer:12 * sizeof(int) access:CPUWriteOnly];
     ((int *)mConstBuffer.contents)[0]  = input->width();
     ((int *)mConstBuffer.contents)[1]  = input->height();
     ((int *)mConstBuffer.contents)[2]  = output->width();
@@ -59,33 +71,27 @@ ErrorCode MetalPooling::onResize(const std::vector<Tensor *> &inputs, const std:
     ((int *)mConstBuffer.contents)[8]  = strideHeight;
     ((int *)mConstBuffer.contents)[9]  = padWidth;
     ((int *)mConstBuffer.contents)[10] = padHeight;
-
+    ((int *)mConstBuffer.contents)[11] = mCountIncludePadding ? 1 : 0;
+    auto ow = output->width(), oh = output->height(), slice = UP_DIV(output->channel(), 4) * output->batch();
+    mPipeline = [context pipelineWithName:(mPoolType == PoolType_MAXPOOL) ? @"pooling_max" : @"pooling_avg" fp16:backend->useFp16InsteadFp32()];
+    auto size = [context computeBestGroupAndLocal:mPipeline threads:MTLSizeMake(ow, oh, slice)];
+    mLocal = size.second;
+    mGroup = size.first;
     return NO_ERROR;
 }
 
-ErrorCode MetalPooling::onExecute(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) {
-    auto backend = static_cast<MetalBackend *>(this->backend());
-    auto context = (__bridge MNNMetalContext *)backend->context();
+void MetalPooling::onEncode(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs, id<MTLComputeCommandEncoder> encoder) {
     auto input = inputs[0], output = outputs[0];
-    auto ow = output->width(), oh = output->height(), slice = UP_DIV(output->channel(), 4) * output->batch();
-
-    auto encoder   = [context encoder];
-    auto bandwidth = [context load:(mPoolType == PoolType_MAXPOOL) ? @"pooling_max" : @"pooling_avg" encoder:encoder];
-    bandwidth.zAxisProtected = YES;
-    [encoder setBuffer:(__bridge id<MTLBuffer>)(void *)input->deviceId() offset:0 atIndex:0];
-    [encoder setBuffer:(__bridge id<MTLBuffer>)(void *)output->deviceId() offset:0 atIndex:1];
+    [encoder setComputePipelineState:mPipeline];
+    [encoder setBuffer:(id<MTLBuffer>)((MetalRuntimeAllocator::MetalBufferAlloc *)input->deviceId())->getBuffer() offset:TensorUtils::getDescribeOrigin(input)->offset atIndex:0];
+    [encoder setBuffer:(id<MTLBuffer>)((MetalRuntimeAllocator::MetalBufferAlloc *)output->deviceId())->getBuffer() offset:TensorUtils::getDescribeOrigin(output)->offset atIndex:1];
     [encoder setBuffer:mConstBuffer offset:0 atIndex:2];
-    [context dispatchEncoder:encoder
-                     threads:{ (NSUInteger) ow, (NSUInteger)oh, (NSUInteger)slice }
-                   bandwidth:bandwidth];
-    [encoder endEncoding];
-    MNN_PRINT_ENCODER(context, encoder);
-    return NO_ERROR;
+    [encoder dispatchThreadgroups:mGroup threadsPerThreadgroup:mLocal];
 }
 
 class MetalPoolingCreator : public MetalBackend::Creator {
 public:
-    virtual Execution *onCreate(const std::vector<Tensor *> &inputs, const MNN::Op *op, Backend *backend) const {
+    virtual Execution *onCreate(const std::vector<Tensor *> &inputs, const MNN::Op *op, Backend *backend, const std::vector<Tensor *>& outputs) const {
         return new MetalPooling(backend, op->main_as_Pool());
     }
 };

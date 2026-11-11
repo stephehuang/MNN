@@ -6,8 +6,8 @@
 //  Copyright © 2018, Alibaba Group Holding Limited
 //
 
+#include "shape/SizeComputer.hpp"
 #include "core/Macro.h"
-#include "core/SizeComputer.hpp"
 #include "core/TensorUtils.hpp"
 namespace MNN {
 
@@ -17,21 +17,22 @@ class TransposeComputer : public SizeComputer {
         const Tensor* input = inputs[0];
         Tensor* perm        = inputs[1];
         const int dims = input->buffer().dimensions;
-        MNN_ASSERT(dims == perm->buffer().dim[0].extent);
-
-        std::vector<int32_t> permutation;
-        if (perm->getType().code == halide_type_int && 32 == perm->getType().bits) {
-            for (int i = 0; i < perm->buffer().dim[0].extent; i++) {
-                permutation.push_back(perm->host<int32_t>()[i]);
-            }
-        } else {
-            MNN_ASSERT(false);
+        if (perm->getType().code != halide_type_int || 32 != perm->getType().bits || dims != perm->buffer().dim[0].extent) {
+            return false;
         }
-
+        auto permutation = perm->host<int32_t>();
         outputs[0]->buffer().dimensions = dims;
         outputs[0]->buffer().type = input->getType();
+        bool used[MNN_MAX_TENSOR_DIM] = {false};
         for (int i = 0; i < dims; ++i) {
             const int32_t d                    = permutation[i];
+            if (d < 0 || d >= dims) {
+                return false;
+            }
+            if (used[d]) {
+                return false;
+            }
+            used[d] = true;
             outputs[0]->buffer().dim[i].extent = input->buffer().dim[d].extent;
         }
         TensorUtils::getDescribe(outputs[0])->dimensionFormat = TensorUtils::getDescribe(inputs[0])->dimensionFormat;

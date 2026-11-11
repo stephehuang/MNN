@@ -8,19 +8,14 @@
 
 #ifndef MNNSharedContext_h
 #define MNNSharedContext_h
+#include "MNNDefine.h"
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 #include <stdint.h> /*uint32_t*/
+#ifdef MNN_VULKAN
 
-#ifndef VK_DEFINE_HANDLE
-#define VK_DEFINE_HANDLE(object) typedef struct object##_T* object;
-VK_DEFINE_HANDLE(VkInstance)
-VK_DEFINE_HANDLE(VkPhysicalDevice)
-VK_DEFINE_HANDLE(VkDevice)
-VK_DEFINE_HANDLE(VkQueue)
-#endif
 struct MNNVulkanContext {
     VkInstance pInstance;
     VkPhysicalDevice pPhysicalDevice;
@@ -28,6 +23,54 @@ struct MNNVulkanContext {
     VkQueue pQueue;
     uint32_t iQueueFamilyIndex;
 };
+
+struct MNNVulkanTensorContent {
+    VkBuffer buffer;
+    VkDeviceSize size;
+    VkDeviceSize offset;
+
+    halide_type_t realType;
+    int32_t mask; // For future usage
+};
+
+#endif
+
+#ifdef MNN_METAL
+struct MNNMetalSharedContext {
+    id<MTLDevice> device;
+    id<MTLCommandQueue> queue;
+};
+
+struct MNNMetalTensorContent {
+    id<MTLBuffer> buffer;
+    int32_t offset;
+    id<MTLTexture> texture;
+    
+    halide_type_t type;
+    int32_t mask;
+    int32_t forFuture[8];
+};
+
+MNN_PUBLIC int MNNMetalGetTensorContent(MNNMetalTensorContent* content, void* tensor);
+MNN_PUBLIC int MNNMetalReleaseContext(void);
+#endif
+
+#ifdef MNN_USER_SET_DEVICE
+
+struct MNNDeviceContext {
+    // When one gpu card has multi devices, choose which device. set deviceId
+    uint32_t deviceId = 0;
+    // When has multi gpu cards, choose which card. set platformId
+    uint32_t platformId = 0;
+    // User set number of gpu cards
+    uint32_t platformSize = 0;
+    // User set OpenCL context ptr
+    void *contextPtr = nullptr;
+};
+
+#endif
+
+
 #ifdef __cplusplus
 }
 #endif

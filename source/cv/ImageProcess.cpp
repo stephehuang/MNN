@@ -8,44 +8,54 @@
 
 #include <algorithm>
 #include <map>
-#include "core/AutoStorage.h"
+#include <MNN/ImageProcess.hpp>
 #include "core/Macro.h"
 #include "core/TensorUtils.hpp"
 #define MNN_OPEN_TIME_TRACE
 #include <MNN/AutoTime.hpp>
-#include "cv/ImageBlitter.hpp"
-#include "cv/ImageFloatBlitter.hpp"
-#include "cv/ImageSampler.hpp"
 #include "backend/cpu/CPUTensorConvert.hpp"
 #include <MNN/MNNForwardType.h>
 #include "core/Backend.hpp"
-#define CACHE_SIZE 256
+
+#include <MNN/Tensor.hpp>
+#include <MNN/Interpreter.hpp>
+#include "core/Execution.hpp"
+#include "core/Backend.hpp"
+#include "MNN_generated.h"
+#include "ImageProcessUtils.hpp"
+
+#ifdef _MSC_VER
+#include "backend/cpu/x86_x64/cpu_id.h"
+#endif
+
 namespace MNN {
+
+void registerBackend();
 namespace CV {
 struct ImageProcess::Inside {
     Config config;
-    AutoStorage<uint8_t> cacheBuffer;
-    AutoStorage<uint8_t> cacheBufferRGBA;
+    // ImageProcessUtils* proc;
+    std::unique_ptr<ImageProcessUtils> proc;
 };
+void ImageProcess::destroy(ImageProcess* pro) {
+    if (nullptr != pro) {
+        delete pro;
+    }
+}
 
 ImageProcess::~ImageProcess() {
     delete mInside;
 }
-
 ImageProcess::ImageProcess(const Config& config) {
     mInside         = new Inside;
     mInside->config = config;
-    mInside->cacheBuffer.reset(4 * CACHE_SIZE);
-    mInside->cacheBufferRGBA.reset(4 * CACHE_SIZE);
-    for (int i = 0; i < 4; ++i) {
-        mInside->config.mean[i]   = config.mean[i];
-        mInside->config.normal[i] = config.normal[i];
-    }
+    registerBackend();
+    auto coreFunctions = MNNGetCoreFunctions();
+    mInside->proc.reset(new ImageProcessUtils(config, coreFunctions));
 }
 
 ImageProcess* ImageProcess::create(const Config& config, const Tensor* dstTensor) {
     // TODO Get dstTensor' backend
-
     return new ImageProcess(config);
 }
 
@@ -64,22 +74,27 @@ ImageProcess* ImageProcess::create(const ImageFormat sourceFormat, const ImageFo
     return new ImageProcess(config);
 }
 
-void ImageProcess::setMatrix(const Matrix& matrix) {
-    mTransform = matrix;
-    mTransform.invert(&mTransformInvert);
+void ImageProcess::setMatrix(const CV::Matrix& matrix) {
+    mInside->proc->setMatrix(matrix);
 }
 
-static int _getBpp(ImageFormat format) {
+static int _getBpp(CV::ImageFormat format) {
     switch (format) {
-        case RGB:
-        case BGR:
+        case CV::RGB:
+        case CV::BGR:
+        case CV::YCrCb:
+        case CV::YUV:
+        case CV::HSV:
+        case CV::XYZ:
             return 3;
-        case RGBA:
-        case BGRA:
+        case CV::RGBA:
+        case CV::BGRA:
             return 4;
-        case GRAY:
+        case CV::GRAY:
             return 1;
-
+        case CV::BGR555:
+        case CV::BGR565:
+            return 2;
         default:
             break;
     }
@@ -90,94 +105,7 @@ Tensor* ImageProcess::createImageTensor(halide_type_t type, int width, int heigh
     return Tensor::create(std::vector<int>{1, height, width, bpp}, type, p);
 }
 
-static int LEFT   = 1 << 0;
-static int RIGHT  = 1 << 1;
-static int TOP    = 1 << 2;
-static int BOTTOM = 1 << 3;
-inline static uint8_t _encode(const Point& p, int iw, int ih) {
-    uint8_t mask = 0;
-    if (p.fX < 0) {
-        mask |= LEFT;
-    }
-    if (p.fX > iw - 1) {
-        mask |= RIGHT;
-    }
-    if (p.fY < 0) {
-        mask |= TOP;
-    }
-    if (p.fY > ih - 1) {
-        mask |= BOTTOM;
-    }
-    return mask;
-}
-
-static std::pair<int, int> _computeClip(Point* points, int iw, int ih, const Matrix& invert, int xStart, int count) {
-    auto code1 = _encode(points[0], iw, ih);
-    auto code2 = _encode(points[1], iw, ih);
-    int sta    = 0;
-    int end    = count;
-
-    float x1     = points[0].fX;
-    float x2     = points[1].fX;
-    float y1     = points[0].fY;
-    float y2     = points[1].fY;
-    int code     = 0;
-    int pIndex   = 0;
-    float deltaY = y2 - y1;
-    float deltaX = x2 - x1;
-    if (deltaX > 0.01f || deltaX < -0.01f) {
-        deltaY = (y2 - y1) / (x2 - x1);
-    } else {
-        deltaY = 0;
-    }
-    if (deltaY > 0.01f || deltaY < -0.01f) {
-        deltaX = (x2 - x1) / (y2 - y1);
-    } else {
-        deltaX = 0;
-    }
-    while (code1 != 0 || code2 != 0) {
-        if ((code1 & code2) != 0) {
-            sta = end;
-            break;
-        }
-        if (code1 != 0) {
-            code   = code1;
-            pIndex = 0;
-        } else if (code2 != 0) {
-            code   = code2;
-            pIndex = 1;
-        }
-        if ((LEFT & code) != 0) {
-            points[pIndex].fY = points[pIndex].fY + deltaY * (0 - points[pIndex].fX);
-            points[pIndex].fX = 0;
-        } else if ((RIGHT & code) != 0) {
-            points[pIndex].fY = points[pIndex].fY + deltaY * (iw - 1 - points[pIndex].fX);
-            points[pIndex].fX = iw - 1;
-        } else if ((BOTTOM & code) != 0) {
-            points[pIndex].fX = points[pIndex].fX + deltaX * (ih - 1 - points[pIndex].fY);
-            points[pIndex].fY = ih - 1;
-        } else if ((TOP & code) != 0) {
-            points[pIndex].fX = points[pIndex].fX + deltaX * (0 - points[pIndex].fY);
-            points[pIndex].fY = 0;
-        }
-        auto tmp = invert.mapXY(points[pIndex].fX, points[pIndex].fY);
-        if (0 == pIndex) {
-            code1 = _encode(points[pIndex], iw, ih);
-            // FUNC_PRINT_ALL(tmp.fX, f);
-            sta = (int)::ceilf(tmp.fX) - xStart;
-        } else {
-            code2 = _encode(points[pIndex], iw, ih);
-            // FUNC_PRINT_ALL(tmp.fX, f);
-            end = (int)::ceilf(tmp.fX) - xStart + 1;
-        }
-    }
-    if (end > count) {
-        end = count;
-    }
-    return std::make_pair(sta, end);
-}
-
-static ImageFormat _correctImageFormat(int outputBpp, halide_type_t type, ImageFormat format) {
+static CV::ImageFormat _correctImageFormat(int outputBpp, halide_type_t type, CV::ImageFormat format) {
     if (outputBpp != 4) {
         return format;
     }
@@ -185,8 +113,8 @@ static ImageFormat _correctImageFormat(int outputBpp, halide_type_t type, ImageF
     if (type.code == halide_type_float) {
         return format;
     }
-
-    static std::map<ImageFormat, ImageFormat> imageFormatTable = {{RGB, RGBA}, {BGR, BGRA}, {GRAY, RGBA}};
+    
+    static std::map<CV::ImageFormat, CV::ImageFormat> imageFormatTable = {{CV::RGB, CV::RGBA}, {CV::BGR, CV::BGRA}, {CV::GRAY, CV::RGBA}};
     if (imageFormatTable.find(format) != imageFormatTable.end()) {
         return imageFormatTable.find(format)->second;
     }
@@ -199,12 +127,16 @@ ErrorCode ImageProcess::convert(const uint8_t* source, int iw, int ih, int strid
         MNN_ERROR("null dest or source for image process\n");
         return INPUT_DATA_ERROR;
     }
+    if (TensorUtils::getDescribeOrigin(dest)->getBackend() == nullptr && destOrigin->buffer().host == nullptr) {
+        MNN_ERROR("Invalid Tensor, the session may not be ready\n");
+        return INPUT_DATA_ERROR;
+    }
     std::shared_ptr<Tensor> tempTensor;
     auto ow              = dest->width();
     auto oh              = dest->height();
     auto bpp             = dest->channel();
     auto dimensionFormat = TensorUtils::getDescribe(dest)->dimensionFormat;
-    auto tensorBn = TensorUtils::getDescribe(dest)->backend;
+    auto tensorBn = TensorUtils::getDescribeOrigin(dest)->getBackend();
     auto bnType = MNN_FORWARD_CPU;
     if(tensorBn){
         bnType = tensorBn->type();
@@ -229,123 +161,38 @@ ErrorCode ImageProcess::convert(const uint8_t* source, int iw, int ih, int strid
     if (dimensionFormat == MNN_DATA_FORMAT_NC4HW4) {
         bpp = 4;
     }
-    return convert(source, iw, ih, stride, dest->host<void>(), ow, oh, bpp, ow * bpp, dest->getType());
+    int ic = _getBpp(mInside->config.sourceFormat);
+    mInside->proc->setPadding(mPaddingValue);
+    mInside->proc->resizeFunc(ic, iw, ih, bpp, ow, oh, dest->getType(), stride);
+    return mInside->proc->execFunc(source, stride, dest->host<void>());
 }
 
 ErrorCode ImageProcess::convert(const uint8_t* source, int iw, int ih, int stride, void* dest, int ow, int oh,
                                 int outputBpp, int outputStride, halide_type_t type) {
-    auto sourceBpp = _getBpp(mInside->config.sourceFormat);
-    if (0 == stride) {
-        stride = iw * sourceBpp;
+    
+    int ic = _getBpp(mInside->config.sourceFormat);
+    int oc = outputBpp;
+    if (outputBpp == 0) {
+        oc = _getBpp(mInside->config.destFormat);
     }
-
-    // AUTOTIME;
-    auto& config      = mInside->config;
-    auto sourceFormat = config.sourceFormat;
-    auto destFormat   = config.destFormat;
-    destFormat        = _correctImageFormat(outputBpp, type, destFormat);
-    auto blitter      = ImageBlitter::choose(sourceFormat, destFormat);
-    if (nullptr == blitter) {
-        return INPUT_DATA_ERROR;
-    }
-    bool identity = mTransform.isIdentity() && iw >= ow && ih >= oh; // TODO, no need for iw, ih limit
-    auto sampler  = ImageSampler::choose(sourceFormat, config.filterType, identity);
-    if (nullptr == sampler) {
-        return INPUT_DATA_ERROR;
-    }
-    if (0 == outputBpp) {
-        outputBpp = _getBpp(destFormat);
-    }
-
-    int tileCount = UP_DIV(ow, CACHE_SIZE);
-    Point points[2];
-    auto sampleBuffer = (uint8_t*)mInside->cacheBuffer.get();
-    auto srcData      = source;
-    auto destBytes    = type.bytes();
-    auto bpp          = outputBpp;
-    auto needBlit     = sourceFormat != destFormat;
-    bool isFloat      = type.code == halide_type_float;
-    //            MNN_PRINT("bpp:%d, destBytes:%d, destFormat:%d, %d, %d\n",bpp, destBytes, ow, oh, dimensionFormat);
-
-    auto blitFloat = ImageFloatBlitter::choose(destFormat, bpp);
-    for (int dy = 0; dy < oh; ++dy) {
-        auto dstY = (uint8_t*)dest + dy * destBytes * ow * bpp;
-        for (int tIndex = 0; tIndex < tileCount; ++tIndex) {
-            int xStart    = tIndex * CACHE_SIZE;
-            int count     = std::min(CACHE_SIZE, ow - xStart);
-            auto dstStart = dstY + destBytes * bpp * xStart;
-
-            auto samplerDest = sampleBuffer;
-            auto blitDest    = mInside->cacheBufferRGBA.get();
-
-            if (!isFloat) {
-                blitDest = dstStart;
-            }
-            if (!needBlit) {
-                samplerDest = blitDest;
-            }
-
-            // Sample
-            {
-                // Compute position
-                points[0].fX = xStart;
-                points[0].fY = dy;
-
-                points[1].fX = xStart + count;
-                points[1].fY = dy;
-
-                mTransform.mapPoints(points, 2);
-                float deltaY = points[1].fY - points[0].fY;
-                float deltaX = points[1].fX - points[0].fX;
-
-                int sta = 0;
-                int end = count;
-
-                // FUNC_PRINT(sta);
-                if (config.wrap == ZERO) {
-                    // Clip: Cohen-Sutherland
-                    auto clip    = _computeClip(points, iw, ih, mTransformInvert, xStart, count);
-                    sta          = clip.first;
-                    end          = clip.second;
-                    points[0].fX = sta + xStart;
-                    points[0].fY = dy;
-
-                    mTransform.mapPoints(points, 1);
-                    if (sta != 0 || end < count) {
-                        if (sourceBpp > 0) {
-                            if (sta > 0) {
-                                ::memset(samplerDest, 0, sourceBpp * sta);
-                            }
-                            if (end < count) {
-                                ::memset(samplerDest + end * sourceBpp, 0, (count - end) * sourceBpp);
-                            }
-                        } else {
-                            // TODO, Only support NV12 / NV21
-                            ::memset(samplerDest, 0, count);
-                            ::memset(samplerDest + count, 128, UP_DIV(count, 2) * 2);
-                        }
-                    }
-                }
-                points[1].fX = (deltaX) / (float)(count);
-                points[1].fY = (deltaY) / (float)(count);
-
-                sampler(srcData, samplerDest, points, sta, end - sta, count, iw, ih, stride);
-            }
-            // Convert format
-            if (needBlit) {
-                blitter(samplerDest, blitDest, count);
-            }
-            // Turn float
-            if (isFloat) {
-                auto normal = mInside->config.normal;
-                auto mean   = mInside->config.mean;
-                blitFloat(blitDest, (float*)dstStart, mean, normal, count);
-            }
-        }
-    }
-
-    return NO_ERROR;
+    mInside->proc->setPadding(mPaddingValue);
+    mInside->proc->resizeFunc(ic, iw, ih, oc, ow, oh, type, stride);
+    return mInside->proc->execFunc(source, stride, dest);
 }
 
+void ImageProcess::setDraw() {
+    if (mInside && mInside->proc) {
+        mInside->proc->setDraw();
+    }
+}
+
+void ImageProcess::draw(uint8_t* img, int w, int h, int c, const int* regions, int num, const uint8_t* color) {
+    std::vector<int32_t> tmpReg(3 * num);
+    ::memcpy(tmpReg.data(), (void*)regions, 4 * 3 * num);
+    double tmpBuf[4];
+    ::memcpy(tmpBuf, color, 4 * sizeof(double));
+    mInside->proc->resizeFunc(c, w, h, c, w, h);
+    mInside->proc->draw(img, w, h, c, tmpReg.data(), num, (uint8_t*)tmpBuf);
+}
 } // namespace CV
 } // namespace MNN

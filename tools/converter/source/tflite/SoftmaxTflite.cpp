@@ -11,12 +11,12 @@
 
 DECLARE_OP_COVERTER(SoftmaxTflite);
 
-MNN::OpType SoftmaxTflite::opType(bool quantizedModel) {
+MNN::OpType SoftmaxTflite::opType(int quantizedModel) {
     if (quantizedModel)
         return MNN::OpType_QuantizedSoftmax;
     return MNN::OpType_Softmax;
 }
-MNN::OpParameter SoftmaxTflite::type(bool quantizedModel) {
+MNN::OpParameter SoftmaxTflite::type(int quantizedModel) {
     if (quantizedModel)
         return MNN::OpParameter_QuantizedSoftmax;
     return MNN::OpParameter_Axis;
@@ -25,11 +25,27 @@ MNN::OpParameter SoftmaxTflite::type(bool quantizedModel) {
 void SoftmaxTflite::run(MNN::OpT* dstOp, const std::unique_ptr<tflite::OperatorT>& tfliteOp,
                         const std::vector<std::unique_ptr<tflite::TensorT>>& tfliteTensors,
                         const std::vector<std::unique_ptr<tflite::BufferT>>& tfliteModelBuffer,
-                        const std::vector<std::unique_ptr<tflite::OperatorCodeT>>& tfliteOpSet, bool quantizedModel) {
+                        const std::vector<std::unique_ptr<tflite::OperatorCodeT>>& tfliteOpSet, int quantizedModel) {
     DCHECK(tfliteOp->inputs.size() == 1) << "Tflite Softmax input ERROR!";
     const auto& tfliteSoftmaxOption = tfliteOp->builtin_options.AsSoftmaxOptions();
+    const int outputIndex    = tfliteOp->outputs[0];
+    const auto& outputTensor = tfliteTensors[outputIndex];
+    if (outputTensor->type == tflite::TensorType_INT8) {
+        quantizedModel = 2;
+        dstOp->type = MNN::OpType_Softmax;
+        dstOp->main.type = MNN::OpParameter_Axis;
+    } else if (outputTensor->type == tflite::TensorType_UINT8) {
+        quantizedModel = 1;
+        dstOp->type = MNN::OpType_QuantizedSoftmax;
+        dstOp->main.type = MNN::OpParameter_QuantizedSoftmax;
+    } else {
+        MNN_ASSERT(outputTensor->type == tflite::TensorType_FLOAT32);
+        quantizedModel = 0;
+        dstOp->type = MNN::OpType_Softmax;
+        dstOp->main.type = MNN::OpParameter_Axis;
+    }
 
-    if (quantizedModel) {
+    if (quantizedModel == 1) {
         auto softmaxParamQuan  = new MNN::QuantizedSoftmaxT();
         softmaxParamQuan->beta = tfliteSoftmaxOption->beta;
         // input
@@ -39,7 +55,7 @@ void SoftmaxTflite::run(MNN::OpT* dstOp, const std::unique_ptr<tflite::OperatorT
         dstOp->main.value            = softmaxParamQuan;
     } else {
         auto paramFloat   = new MNN::AxisT;
-        paramFloat->axis  = 1;
+        paramFloat->axis  = -1;
         dstOp->main.value = paramFloat;
     }
     // set input output index

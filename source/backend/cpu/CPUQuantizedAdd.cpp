@@ -5,12 +5,22 @@
 //  Created by MNN on 2018/10/18.
 //  Copyright © 2018, Alibaba Group Holding Limited
 //
-#ifdef MNN_SUPPORT_TFLITE_QUAN
-#include "backend/cpu/CPUQuantizedAdd.hpp"
 #include "backend/cpu/CPUBackend.hpp"
+#ifdef MNN_SUPPORT_DEPRECATED_OP
+#include "backend/cpu/CPUQuantizedAdd.hpp"
 #include "backend/cpu/CPUQuantizationUtils.hpp"
+#include "compute/CommonOptFunction.h"
 #include "core/Concurrency.h"
 #include "core/Macro.h"
+
+#if defined(__riscv) && defined(MNN_USE_RVV)
+extern void CPUQuantizedAdd_RVV(const uint8_t* input1Data, const uint8_t* input2Data, uint8_t* outputData, size_t size,
+                                int32_t input1Offset, int32_t input2Offset, int32_t outputOffset,
+                                int32_t leftShiftResult1, int32_t leftShiftResult2, int32_t input1Multiplier,
+                                int32_t input2Multiplier, int32_t rightShift1, int32_t rightShift2,
+                                int32_t leftShiftOut, int32_t outputMultiplier, int32_t rightShiftOut,
+                                int32_t outputActivationMin, int32_t outputActivationMax);
+#endif
 
 namespace MNN {
 
@@ -19,6 +29,7 @@ CPUQuantizedAdd::CPUQuantizedAdd(Backend *backend, const Op *op) : Execution(bac
 }
 
 ErrorCode CPUQuantizedAdd::onResize(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) {
+
     mInput1Offset                   = -mQuantizedAddParam->input1QuantizedParam()->zeroPoint();
     mInput2Offset                   = -mQuantizedAddParam->input2QuantizedParam()->zeroPoint();
     mOutputOffset                   = mQuantizedAddParam->outputQuantizedParam()->zeroPoint();
@@ -53,13 +64,17 @@ ErrorCode CPUQuantizedAdd::onResize(const std::vector<Tensor *> &inputs, const s
     mLeftShiftResult1 = (1 << leftShift) * ((1 << leftShift1));
     mLeftShiftResult2 = (1 << leftShift) * ((1 << leftShift2));
 
-    const int left1 = leftShift + leftShift1;
-    const int left2 = leftShift + leftShift2;
+    MNN_ASSERT(leftShift + leftShift1 == leftShift);
+    MNN_ASSERT(leftShift + leftShift2 == leftShift);
 
-    MNN_ASSERT(left1 == leftShift);
-    MNN_ASSERT(left2 == leftShift);
+    return NO_ERROR;
+}
 
+ErrorCode CPUQuantizedAdd::onExecute(const std::vector<MNN::Tensor *> &inputs,
+                                     const std::vector<MNN::Tensor *> &outputs) {
 #ifdef MNN_USE_NEON
+    int16x8_t input1OffsetVec, input2OffsetVec;
+    int32x4_t outputOffsetVec, outputActivationMinVec, outputActivationMaxVec, leftShiftResult1Vec, leftShiftResult2Vec, input1MultiplierVec, input2MultiplierVec, outputMultiplierVec, leftShiftOutVec, rightShift1Vec, rightShift2Vec;
     input1OffsetVec        = vdupq_n_s16(mInput1Offset);
     input2OffsetVec        = vdupq_n_s16(mInput2Offset);
     outputOffsetVec        = vdupq_n_s32(mOutputOffset);
@@ -74,13 +89,6 @@ ErrorCode CPUQuantizedAdd::onResize(const std::vector<Tensor *> &inputs, const s
     rightShift1Vec      = vdupq_n_s32(-mRightShift1);
     rightShift2Vec      = vdupq_n_s32(-mRightShift2);
 #endif
-
-    return NO_ERROR;
-}
-
-ErrorCode CPUQuantizedAdd::onExecute(const std::vector<MNN::Tensor *> &inputs,
-                                     const std::vector<MNN::Tensor *> &outputs) {
-
     uint8_t *input1Data = inputs[0]->host<uint8_t>();
     uint8_t *input2Data = inputs[1]->host<uint8_t>();
     uint8_t *outputData = outputs[0]->host<uint8_t>();
@@ -89,6 +97,25 @@ ErrorCode CPUQuantizedAdd::onExecute(const std::vector<MNN::Tensor *> &inputs,
     int size = inputs[0]->batch()*inputs[0]->height()*inputs[0]->width()*ROUND_UP(outputChannels, 4);
     int threadNumber = std::max(((CPUBackend *)backend())->threadNumber(), 1);
     int countUnit    = UP_DIV(size, threadNumber);
+
+#if defined(__riscv) && defined(MNN_USE_RVV)
+    if (((CPUBackend *)backend())->functions()->supportRVV) {
+        MNN_CONCURRENCY_BEGIN(tId, threadNumber) {
+            int realDstCount       = (int)ALIMIN(size - tId * countUnit, countUnit);
+            uint8_t *curInput1Data = input1Data + tId * countUnit;
+            uint8_t *curInput2Data = input2Data + tId * countUnit;
+            uint8_t *curOutputData = outputData + tId * countUnit;
+            if (realDstCount > 0) {
+                CPUQuantizedAdd_RVV(curInput1Data, curInput2Data, curOutputData, (size_t)realDstCount, mInput1Offset,
+                                    mInput2Offset, mOutputOffset, mLeftShiftResult1, mLeftShiftResult2,
+                                    mInput1Multiplier, mInput2Multiplier, mRightShift1, mRightShift2, mLeftShiftOut,
+                                    mOutputMultiplier, mRightShiftOut, mOutputActivationMin, mOutputActivationMax);
+            }
+        }
+        MNN_CONCURRENCY_END();
+        return NO_ERROR;
+    }
+#endif
 
     MNN_CONCURRENCY_BEGIN(tId, threadNumber) {
         int realDstCount       = (int)ALIMIN(size - tId * countUnit, countUnit);
@@ -207,6 +234,8 @@ public:
         return new CPUQuantizedAdd(backend, op);
     }
 };
-REGISTER_CPU_OP_CREATOR(CPUQuantizedAddCreator, OpType_QuantizedAdd);
 } // namespace MNN
 #endif
+namespace MNN {
+REGISTER_CPU_OP_CREATOR_OLD(CPUQuantizedAddCreator, OpType_QuantizedAdd);
+}
